@@ -1,0 +1,171 @@
+# SmallServer
+
+SmallServer is a SmallOS-native web framework in early development. It provides
+a bounded HTTP/1.1 server and static async routing for GET, POST, PUT, PATCH,
+and DELETE.
+
+## Current scope
+
+The current package provides an HTTP/1.1 baseline over a SmallOS runtime. It can:
+
+- register static async routes for GET, POST, PUT, PATCH, and DELETE;
+- dispatch an already-created `Request` to a handler;
+- return deterministic `Response` values, including HTTP/1.1 bytes;
+- return 404 for an unknown path and 405 with `Allow` for a known path using
+  the wrong method.
+- bind a non-blocking TCP listener, accept bounded concurrent connections, and
+  wait for read/write readiness through SmallOS;
+- parse one `Content-Length` HTTP/1.1 request per connection and close after
+  its response.
+
+Keep-alive/pipelining, TLS, path parameters, HTTP/2, and third-party execution
+integration are not implemented yet.
+
+## Install for development
+
+```bash
+python3 -m pip install -r requirements.txt
+python3 -m pip install -e .
+python3 -m unittest discover -s tests -v
+```
+
+SmallOS is installed from the canonical `master` branch in `requirements.txt`.
+It owns scheduling and socket readiness.
+
+## Run the demo
+
+The included demo binds an ephemeral loopback TCP port, starts the SmallOS
+runtime, and uses a separate loopback client to exercise the real listener.
+
+```bash
+python3 -m pip install -r requirements.txt
+python3 demo.py
+```
+
+It exercises POST, GET, PATCH, PUT, DELETE, and a 404 response. The static
+`/tasks` path is intentional: path parameters arrive with a later milestone.
+
+## Bind a server
+
+Create the application, bind it to a SmallOS runtime, then start that runtime.
+`port=0` asks the operating system for an available port, which is useful in
+tests and local tooling.
+
+```python
+from SmallPackage import SmallOS, Unix
+from smallserver import Response, SmallServer
+
+runtime = SmallOS().setKernel(Unix())
+app = SmallServer()
+
+@app.get("/health")
+async def health(request):
+    return Response.json({"status": "ok"})
+
+server = app.serve(runtime, host="127.0.0.1", port=8000)
+runtime.start()
+```
+
+Call `server.close()` from another thread or client-control path to request a
+scheduler-safe shutdown. Each current connection accepts one request and sends
+a `Connection: close` response.
+
+## Define routes
+
+Use one decorator for each supported method. Handlers receive an immutable
+`Request` and must return a `Response`.
+
+```python
+from smallserver import Request, Response, SmallServer
+
+app = SmallServer()
+
+@app.get("/health")
+async def health(request: Request) -> Response:
+    return Response.json({"status": "ok"})
+
+@app.post("/widgets")
+async def create_widget(request: Request) -> Response:
+    # request.body is always bytes.
+    return Response.json({"created": True}, status=201)
+
+@app.put("/widgets")
+async def replace_widgets(request: Request) -> Response:
+    return Response.text("replaced")
+
+@app.patch("/widgets")
+async def patch_widgets(request: Request) -> Response:
+    return Response.text("updated")
+
+@app.delete("/widgets")
+async def delete_widgets(request: Request) -> Response:
+    return Response(status=204)
+```
+
+Route paths are static in this release. Path parameters and server lifecycle
+APIs will follow with the SmallOS socket integration.
+
+## Dispatch a request
+
+The listener creates requests and calls `dispatch()`. The same boundary is
+useful in application tests:
+
+```python
+request = Request(
+    method="GET",
+    path="/health",
+    headers={"Accept": "application/json"},
+)
+
+response = await app.dispatch(request)
+assert response.status == 200
+assert response.body == b'{"status":"ok"}'
+assert response.headers["content-type"] == "application/json"
+```
+
+For a path that is registered but does not accept the request method,
+`dispatch()` returns a 405 response and an `Allow` header. An unknown path
+returns 404.
+
+## Build responses
+
+`Response.text()` encodes UTF-8 text and supplies a text content type.
+`Response.json()` emits compact UTF-8 JSON. The response serializer adds an
+accurate `Content-Length` header when one was not supplied.
+
+```python
+response = Response.text("hello", headers={"X-Request-ID": "abc123"})
+wire_bytes = response.to_http1()
+
+# b"HTTP/1.1 200 OK\\r\\nContent-Length: 5..."
+```
+
+Header names and values are validated: duplicate names (case-insensitively)
+and values containing CR or LF are rejected.
+
+## Expected application errors
+
+Raise `HTTPError` inside a handler when an expected client-facing response is
+clearer than constructing it inline:
+
+```python
+from smallserver import HTTPError
+
+@app.delete("/widgets")
+async def delete_widget(request: Request) -> Response:
+    raise HTTPError(413, "request is too large")
+```
+
+`dispatch()` turns this into a text response with status 413. Unexpected
+exceptions are intentionally left visible for the future SmallOS server's
+runtime error handling.
+
+## Development relationship
+
+SmallOS's canonical upstream is [MikiEEE/SmallOS](https://github.com/MikiEEE/SmallOS). During initial development, install the canonical `master` branch:
+
+```bash
+python3 -m pip install -r requirements.txt
+```
+
+SmallOS's normalized distribution name is currently unavailable for public package installation; SmallServer must not claim a PyPI dependency until that is resolved.
