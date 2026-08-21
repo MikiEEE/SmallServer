@@ -1,8 +1,8 @@
 # SmallServer
 
 SmallServer is a SmallOS-native web framework in early development. It provides
-a bounded HTTP/1.1 server and static async routing for GET, POST, PUT, PATCH,
-and DELETE.
+a bounded HTTP/1.1 server, static async routing for GET, POST, PUT, PATCH, and
+DELETE, and explicit escape hatches for blocking and asyncio-native libraries.
 
 ## Current scope
 
@@ -18,8 +18,7 @@ The current package provides an HTTP/1.1 baseline over a SmallOS runtime. It can
 - parse one `Content-Length` HTTP/1.1 request per connection and close after
   its response.
 
-Keep-alive/pipelining, TLS, path parameters, HTTP/2, and third-party execution
-integration are not implemented yet.
+Keep-alive/pipelining, TLS, path parameters, and HTTP/2 are not implemented yet.
 
 ## Install for development
 
@@ -30,7 +29,7 @@ python3 -m unittest discover -s tests -v
 ```
 
 SmallOS is installed from the canonical `master` branch in `requirements.txt`.
-It owns scheduling and socket readiness.
+It owns scheduling, socket readiness, and foreign execution adapters.
 
 ## Run the demo
 
@@ -160,6 +159,46 @@ async def delete_widget(request: Request) -> Response:
 `dispatch()` turns this into a text response with status 413. Unexpected
 exceptions are intentionally left visible for the future SmallOS server's
 runtime error handling.
+
+## Third-party blocking and asyncio libraries
+
+SmallServer delegates foreign execution to SmallOS's bounded adapters. The
+application creates those adapters explicitly and can group them in an
+`AdapterRegistry` for naming and deterministic shutdown:
+
+```python
+from SmallPackage.adapters.asyncio_loop import AsyncioAdapter
+from SmallPackage.adapters.threads import ThreadAdapter
+from smallserver import AdapterRegistry, Response
+
+with AdapterRegistry(
+    database=ThreadAdapter(max_workers=1, max_pending=8),
+    async_sdk=AsyncioAdapter(max_pending=32),
+) as services:
+
+    @app.get("/records")
+    async def records(request):
+        rows = await services.call("database", repository.list_records)
+        result = await services.call("async_sdk", async_client.fetch, rows)
+        return Response.json(result)
+
+    server = app.serve(runtime, host="127.0.0.1", port=8000)
+    runtime.start()
+```
+
+Use one thread worker for thread-affine resources such as a single SQLite
+connection. `AsyncioAdapter` owns one persistent event loop and must receive an
+async callable, not a task or future created on another loop.
+
+Adapter errors remain visible to handlers. `http_error_from_adapter()` is an
+opt-in, detail-sanitizing translation: capacity/unavailable failures become
+503 and protocol/execution failures become 500.
+
+Run the standard-library adapter example with:
+
+```bash
+python3 examples/adapters_demo.py
+```
 
 ## Development relationship
 
