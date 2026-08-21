@@ -10,6 +10,7 @@ from SmallPackage.adapters.threads import ThreadAdapter
 
 from smallserver import (
     AdapterRegistry,
+    AdapterShutdownError,
     Headers,
     Request,
     Response,
@@ -23,12 +24,14 @@ class FakeAdapter:
         self.events = events
         self.name = name
         self.closed = False
+        self.shutdown_calls = 0
 
     def call(self, callable_obj, /, *args, **kwargs):
         return callable_obj(*args, **kwargs)
 
     def shutdown(self, wait=True, cancel_pending=False) -> None:
         self.closed = True
+        self.shutdown_calls += 1
         self.events.append(self.name)
 
 
@@ -53,6 +56,43 @@ class AdapterRegistryTests(unittest.TestCase):
         failed = http_error_from_adapter(AdapterProtocolError("secret protocol detail"))
         self.assertEqual((overloaded.status, overloaded.detail), (503, "service is at capacity"))
         self.assertEqual((failed.status, failed.detail), (500, "service execution failed"))
+
+    def test_registry_rejects_aliases_and_preserves_interrupts(self) -> None:
+        events: list[str] = []
+        shared = FakeAdapter(events, "shared")
+        registry = AdapterRegistry(primary=shared)
+        with self.assertRaisesRegex(ValueError, "registered as"):
+            registry.register("alias", shared)
+
+        class InterruptingAdapter(FakeAdapter):
+            def shutdown(self, wait=True, cancel_pending=False) -> None:
+                super().shutdown(wait=wait, cancel_pending=cancel_pending)
+                raise KeyboardInterrupt("stop")
+
+        trailing = FakeAdapter(events, "trailing")
+        interrupting = InterruptingAdapter(events, "interrupting")
+        registry = AdapterRegistry(trailing=trailing, interrupting=interrupting)
+        with self.assertRaisesRegex(KeyboardInterrupt, "stop"):
+            registry.shutdown()
+        self.assertEqual(events[-2:], ["interrupting", "trailing"])
+        self.assertEqual(trailing.shutdown_calls, 1)
+
+    def test_registry_aggregates_ordinary_shutdown_failures(self) -> None:
+        events: list[str] = []
+
+        class BrokenAdapter(FakeAdapter):
+            def shutdown(self, wait=True, cancel_pending=False) -> None:
+                super().shutdown(wait=wait, cancel_pending=cancel_pending)
+                raise RuntimeError(self.name)
+
+        registry = AdapterRegistry(
+            first=BrokenAdapter(events, "first"),
+            second=BrokenAdapter(events, "second"),
+        )
+        with self.assertRaises(AdapterShutdownError) as raised:
+            registry.shutdown()
+        self.assertEqual(events, ["second", "first"])
+        self.assertEqual([name for name, _ in raised.exception.failures], ["second", "first"])
 
     def test_route_handler_uses_thread_and_asyncio_adapters(self) -> None:
         runtime = SmallOS().setKernel(Unix())
