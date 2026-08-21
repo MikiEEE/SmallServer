@@ -62,6 +62,8 @@ class HTTPRequestParser:
         method, path, version = lines[0].split(" ")
         if version != "HTTP/1.1" or not path.startswith("/"):
             raise HTTPParseError(400, "only origin-form HTTP/1.1 requests are supported")
+        if "#" in path or any(not 0x21 <= ord(character) <= 0x7E for character in path):
+            raise HTTPParseError(400, "request target is not valid origin-form")
         if len(lines) - 1 > self._max_header_count:
             raise HTTPParseError(413, "too many request headers")
         pairs: list[tuple[str, str]] = []
@@ -90,6 +92,8 @@ class HTTPRequestParser:
             length = int(value)
             if length > self._max_body_bytes:
                 raise HTTPParseError(413, "request body is too large")
+        if not headers.get("host"):
+            raise HTTPParseError(400, "HTTP/1.1 requests require a Host header")
         return method, path, headers, length
 
 
@@ -107,7 +111,7 @@ class ServerConfig:
 
     def __post_init__(self) -> None:
         for name, value in self.__dict__.items():
-            if not isinstance(value, int) or value <= 0:
+            if type(value) is not int or value <= 0:
                 raise ValueError("{} must be a positive integer".format(name))
 
 
@@ -154,6 +158,22 @@ class ServerHandle:
         self._connections.clear()
         if self._listener_task is not None:
             self._runtime.resume_task(self._listener_task)
+        for sock in (self._listener, self._wake_read, self._wake_write):
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def _abort_startup(self, tasks: tuple[Any, ...]) -> None:
+        """Release bound resources after task registration fails."""
+        self._closed = True
+        cancel_task = getattr(self._runtime, "cancel_task", None)
+        if callable(cancel_task):
+            for task in tasks:
+                try:
+                    cancel_task(task)
+                except BaseException:
+                    pass
         for sock in (self._listener, self._wake_read, self._wake_write):
             try:
                 sock.close()

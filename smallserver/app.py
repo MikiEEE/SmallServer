@@ -100,7 +100,12 @@ class SmallServer:
             name="smallserver-close-watcher",
         )
         handle._listener_task = listener_task
-        runtime.fork([listener_task, close_task])
+        tasks = (listener_task, close_task)
+        try:
+            runtime.fork(list(tasks))
+        except BaseException:
+            handle._abort_startup(tasks)
+            raise
         return handle
 
     async def dispatch(self, request: Request) -> Response:
