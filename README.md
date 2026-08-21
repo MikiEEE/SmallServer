@@ -171,6 +171,11 @@ from SmallPackage.adapters.asyncio_loop import AsyncioAdapter
 from SmallPackage.adapters.threads import ThreadAdapter
 from smallserver import AdapterRegistry, Response
 
+async def fetch_records(rows):
+    # Construct loop-affine clients inside the adapter-owned event loop.
+    async with make_async_client() as client:
+        return await client.fetch(rows)
+
 with AdapterRegistry(
     database=ThreadAdapter(max_workers=1, max_pending=8),
     async_sdk=AsyncioAdapter(max_pending=32),
@@ -179,7 +184,7 @@ with AdapterRegistry(
     @app.get("/records")
     async def records(request):
         rows = await services.call("database", repository.list_records)
-        result = await services.call("async_sdk", async_client.fetch, rows)
+        result = await services.call("async_sdk", fetch_records, rows)
         return Response.json(result)
 
     server = app.serve(runtime, host="127.0.0.1", port=8000)

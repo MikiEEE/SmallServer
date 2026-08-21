@@ -51,6 +51,11 @@ class AdapterRegistry:
             raise ValueError("adapter name must be a non-empty identifier")
         if name in self._adapters:
             raise ValueError("adapter is already registered: {}".format(name))
+        for registered_name, registered_adapter in self._adapters.items():
+            if registered_adapter is adapter:
+                raise ValueError(
+                    "adapter is already registered as: {}".format(registered_name)
+                )
         for method_name in ("call", "shutdown"):
             if not callable(getattr(adapter, method_name, None)):
                 raise TypeError("adapter must provide {}()".format(method_name))
@@ -88,11 +93,17 @@ class AdapterRegistry:
             return
         self._closed = True
         failures: list[tuple[str, BaseException]] = []
+        interrupt: BaseException | None = None
         for name, adapter in reversed(tuple(self._adapters.items())):
             try:
                 adapter.shutdown(wait=wait, cancel_pending=cancel_pending)
             except BaseException as exc:
-                failures.append((name, exc))
+                if isinstance(exc, Exception):
+                    failures.append((name, exc))
+                elif interrupt is None:
+                    interrupt = exc
+        if interrupt is not None:
+            raise interrupt
         if failures:
             raise AdapterShutdownError(tuple(failures))
 
