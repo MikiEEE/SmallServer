@@ -22,7 +22,11 @@ class Headers(Mapping[str, str]):
         for name, value in items:
             if not isinstance(name, str) or not _TOKEN.fullmatch(name):
                 raise ValueError("invalid HTTP header name")
-            if not isinstance(value, str) or "\r" in value or "\n" in value:
+            if not isinstance(value, str) or any(
+                character != "\t"
+                and (ord(character) < 0x20 or ord(character) == 0x7F or ord(character) > 0xFF)
+                for character in value
+            ):
                 raise ValueError("invalid HTTP header value")
             key = name.lower()
             if key in normalized:
@@ -106,4 +110,4 @@ class Response:
         if self.headers.get("content-length") is None:
             lines.append("Content-Length: {}".format(len(self.body)))
         lines.extend("{}: {}".format(name, value) for name, value in self.headers.items())
-        return ("\r\n".join(lines) + "\r\n\r\n").encode("ascii") + self.body
+        return ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1") + self.body

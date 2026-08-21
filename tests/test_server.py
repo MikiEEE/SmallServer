@@ -1,5 +1,7 @@
 import unittest
+from unittest.mock import patch
 
+from smallserver import SmallServer
 from smallserver.server import HTTPParseError, HTTPRequestParser, ServerConfig
 
 
@@ -27,6 +29,50 @@ class HTTPRequestParserTests(unittest.TestCase):
         with self.assertRaisesRegex(HTTPParseError, "body is too large"):
             self.parser().feed(b"POST / HTTP/1.1\r\nContent-Length: 33\r\n\r\n")
 
+    def test_requires_host_and_rejects_invalid_origin_form(self) -> None:
+        with self.assertRaisesRegex(HTTPParseError, "Host"):
+            self.parser().feed(b"GET / HTTP/1.1\r\n\r\n")
+        with self.assertRaisesRegex(HTTPParseError, "origin-form"):
+            self.parser().feed(b"GET /items#fragment HTTP/1.1\r\nHost: localhost\r\n\r\n")
+
     def test_config_rejects_unbounded_limits(self) -> None:
         with self.assertRaisesRegex(ValueError, "max_connections"):
             ServerConfig(max_connections=0)
+        with self.assertRaisesRegex(ValueError, "max_connections"):
+            ServerConfig(max_connections=True)
+
+    def test_serve_closes_bound_socket_when_runtime_fork_fails(self) -> None:
+        class Listener:
+            closed = False
+
+            def setsockopt(self, *args) -> None:
+                pass
+
+            def bind(self, address) -> None:
+                pass
+
+            def listen(self, backlog) -> None:
+                pass
+
+            def setblocking(self, blocking) -> None:
+                pass
+
+            def close(self) -> None:
+                self.closed = True
+
+        class Runtime:
+            cancelled = 0
+
+            def fork(self, tasks) -> None:
+                raise RuntimeError("no task capacity")
+
+            def cancel_task(self, task) -> None:
+                self.cancelled += 1
+
+        listener = Listener()
+        runtime = Runtime()
+        with patch("smallserver.app.socket.socket", return_value=listener):
+            with self.assertRaisesRegex(RuntimeError, "capacity"):
+                SmallServer().serve(runtime)
+        self.assertTrue(listener.closed)
+        self.assertEqual(runtime.cancelled, 2)

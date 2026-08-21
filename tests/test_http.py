@@ -23,3 +23,11 @@ class HTTPValueTests(unittest.TestCase):
             Headers({"X-Test": "ok\r\nInjected: true"})
         with self.assertRaisesRegex(ValueError, "path"):
             Request("GET", "items", Headers())
+
+    def test_header_values_match_the_wire_encoding(self) -> None:
+        response = Response(headers=Headers({"X-Label": "caf\N{LATIN SMALL LETTER E WITH ACUTE}"}))
+        self.assertIn(b"X-Label: caf\xe9\r\n", response.to_http1())
+        for invalid in ("nul\x00", "delete\x7f", "emoji \N{GRINNING FACE}"):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(ValueError, "header value"):
+                    Headers({"X-Test": invalid})
