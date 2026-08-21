@@ -102,8 +102,8 @@ async def delete_widgets(request: Request) -> Response:
     return Response(status=204)
 ```
 
-Route paths are static in this release. Path parameters and server lifecycle
-APIs will follow with the SmallOS socket integration.
+Route paths are static in this release. Path parameters and richer lifecycle
+hooks are deferred; the current `ServerHandle` provides explicit shutdown.
 
 ## Dispatch a request
 
@@ -140,8 +140,9 @@ wire_bytes = response.to_http1()
 # b"HTTP/1.1 200 OK\\r\\nContent-Length: 5..."
 ```
 
-Header names and values are validated: duplicate names (case-insensitively)
-and values containing CR or LF are rejected.
+Header names and values are validated: duplicate names (case-insensitively),
+forbidden control characters, and values outside the HTTP/1.1 Latin-1 wire
+range are rejected.
 
 ## Expected application errors
 
