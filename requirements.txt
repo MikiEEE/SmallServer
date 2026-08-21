@@ -1,0 +1,3 @@
+# Install SmallOS directly from its canonical master branch. The PyPI package
+# name is not yet available to this project.
+-e git+https://github.com/MikiEEE/SmallOS.git@master#egg=SmallPackage

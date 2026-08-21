@@ -1,0 +1,13 @@
+# Local agent plans and generated documentation index.
+docs/
+skills/
+
+# Python build and test output.
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.egg-info/
+
+# Editable VCS dependency checkouts.
+src/
