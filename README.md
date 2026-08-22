@@ -1,8 +1,9 @@
 # SmallServer
 
 SmallServer is a SmallOS-native web framework in early development. It provides
-a bounded HTTP/1.1 server, static async routing for GET, POST, PUT, PATCH, and
-DELETE, and explicit escape hatches for blocking and asyncio-native libraries.
+bounded HTTP/1.1 and optional cleartext HTTP/2 servers, static async routing for
+GET, POST, PUT, PATCH, and DELETE, and explicit escape hatches for blocking and
+asyncio-native libraries.
 
 ## Current scope
 
@@ -18,7 +19,8 @@ The current package provides an HTTP/1.1 baseline over a SmallOS runtime. It can
 - parse one `Content-Length` HTTP/1.1 request per connection and close after
   its response.
 
-Keep-alive/pipelining, TLS, path parameters, and HTTP/2 are not implemented yet.
+HTTP/1.1 keep-alive/pipelining, TLS, and path parameters are not implemented
+yet. HTTP/2 currently supports cleartext prior knowledge only.
 
 ## Install for development
 
@@ -26,6 +28,12 @@ Keep-alive/pipelining, TLS, path parameters, and HTTP/2 are not implemented yet.
 python3 -m pip install -r requirements.txt
 python3 -m pip install -e .
 python3 -m unittest discover -s tests -v
+```
+
+Install the bounded optional hyper-h2 4.x integration when serving HTTP/2:
+
+```bash
+python3 -m pip install -e '.[http2]'
 ```
 
 SmallOS is installed from the canonical `master` branch in `requirements.txt`.
@@ -64,6 +72,37 @@ async def health(request):
 
 app.listen(host="127.0.0.1", port=8000)
 ```
+
+## Cleartext HTTP/2
+
+HTTP/2 uses the same routes, `Request`, `Response`, and SmallOS runtime. Select
+it explicitly on a listener; protocol auto-detection and h2c upgrade are not
+performed:
+
+```python
+from smallserver import HTTP2Config, Response, SmallServer
+
+app = SmallServer()
+
+@app.get("/health")
+async def health(request):
+    return Response.json({"status": "ok", "protocol": request.version})
+
+app.listen(
+    host="127.0.0.1",
+    port=8000,
+    protocol="http2",
+    http2_config=HTTP2Config(max_concurrent_streams=32),
+)
+```
+
+Run `python3 examples/http2_prior_knowledge.py`, then use an HTTP/2-capable
+client such as `curl --http2-prior-knowledge http://127.0.0.1:8000/health`.
+See [the HTTP/2 guide](guide/http2.md) for limits and lifecycle behavior.
+
+TLS/ALPN is explicitly deferred: SmallOS does not yet expose a server-side TLS
+kernel capability. SmallServer does not bypass that boundary with direct
+`ssl` or `socket` access.
 
 Managed `listen()` blocks and catches Ctrl-C after closing its listener, wakeup
 channel, connections, and server tasks. It returns the closed `ServerHandle`,
