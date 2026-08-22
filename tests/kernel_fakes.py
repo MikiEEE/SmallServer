@@ -11,6 +11,18 @@ class NeedsWrite(Exception):
     pass
 
 
+class TLSWantRead(NeedsRead):
+    pass
+
+
+class TLSWantWrite(NeedsWrite):
+    pass
+
+
+class WouldBlock(BlockingIOError):
+    pass
+
+
 @dataclass
 class OpaqueHandle:
     """Intentionally unhashable stand-in for a backend-owned resource."""
@@ -24,12 +36,19 @@ class FakeWakeupChannel:
         self.notify_calls = 0
         self.drain_calls = 0
         self.close_calls = 0
+        self.notify_failures = 0
+        self.drain_error: BaseException | None = None
 
     def notify(self) -> None:
         self.notify_calls += 1
+        if self.notify_failures:
+            self.notify_failures -= 1
+            raise RuntimeError("notify failed")
 
     def drain(self) -> None:
         self.drain_calls += 1
+        if self.drain_error is not None:
+            raise self.drain_error
 
     def close(self) -> None:
         self.close_calls += 1
@@ -50,6 +69,9 @@ class FakeKernel:
         self.sent: dict[int, list[bytes]] = {}
         self.peer_addresses: dict[int, object | None] = {}
         self.fail_operation: str | None = None
+        self.operation_errors: dict[str, BaseException] = {}
+        self.close_failures: dict[int, int] = {}
+        self.invalid_wait_objects: set[int] = set()
 
     def supports_tcp_server(self) -> bool:
         self.calls.append(("supports_tcp_server",))
@@ -68,6 +90,8 @@ class FakeKernel:
         return self.listener
 
     def _maybe_fail(self, operation: str) -> None:
+        if operation in self.operation_errors:
+            raise self.operation_errors[operation]
         if self.fail_operation == operation:
             raise RuntimeError("{} failed".format(operation))
 
@@ -122,6 +146,10 @@ class FakeKernel:
 
     def socket_close(self, stream: object) -> None:
         self.calls.append(("socket_close", stream))
+        failures = self.close_failures.get(id(stream), 0)
+        if failures:
+            self.close_failures[id(stream)] = failures - 1
+            raise RuntimeError("close failed")
         self.closed.append(stream)  # type: ignore[arg-type]
 
     def socket_needs_read(self, exc: BaseException) -> bool:
@@ -129,6 +157,20 @@ class FakeKernel:
 
     def socket_needs_write(self, exc: BaseException) -> bool:
         return isinstance(exc, NeedsWrite)
+
+    def socket_retry_mode(self, exc: BaseException, operation: str) -> str | None:
+        if isinstance(exc, NeedsRead):
+            return "read"
+        if isinstance(exc, NeedsWrite):
+            return "write"
+        if isinstance(exc, WouldBlock):
+            return "write" if operation == "send" else "read"
+        return None
+
+    def validate_io_wait_object(self, obj: object) -> tuple[bool, BaseException | None]:
+        if id(obj) in self.invalid_wait_objects:
+            return False, ValueError("invalid wait object")
+        return True, None
 
     def create_wakeup_channel(self) -> FakeWakeupChannel:
         self.calls.append(("create_wakeup_channel",))
