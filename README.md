@@ -92,6 +92,9 @@ app.listen(host="127.0.0.1", port=8000, config=config)
 This bridge is only for SmallServer-owned runtimes. If you supply `runtime=`,
 configure it directly with `SmallOS(config=...)`; SmallServer rejects
 `managed_runtime` rather than mutating caller-owned scheduler state.
+`task_capacity` must reserve at least `max_connections + 2` task slots for the
+listener and shutdown-control tasks, and both server task priorities must be
+below `priority_levels`.
 
 Managed `listen()` blocks and catches Ctrl-C after closing its listener, wakeup
 channel, connections, and server tasks. It returns the closed `ServerHandle`,

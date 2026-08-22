@@ -120,6 +120,21 @@ class ServerLifecycleTests(unittest.TestCase):
                 SmallServer().listen(config=config, port=0)
         factory.assert_not_called()
 
+        insufficient = ServerConfig(
+            max_connections=32,
+            managed_runtime=ManagedRuntimeConfig(task_capacity=33),
+        )
+        with patch("smallserver.app._default_runtime_factory") as factory:
+            with self.assertRaisesRegex(ValueError, r"max_connections \+ 2"):
+                SmallServer().listen(config=insufficient, port=0)
+        factory.assert_not_called()
+
+        implicit_defaults = ServerConfig(max_connections=1023)
+        with patch("smallserver.app._default_runtime_factory") as factory:
+            with self.assertRaisesRegex(ValueError, r"max_connections \+ 2"):
+                SmallServer().listen(config=implicit_defaults, port=0)
+        factory.assert_not_called()
+
     def test_primary_demo_hides_runtime_and_registers_all_http_methods(self) -> None:
         root = Path(__file__).parents[1]
         demo_path = root / "demo.py"
