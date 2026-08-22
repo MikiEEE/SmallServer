@@ -233,6 +233,8 @@ class SmallServer:
                 failure.transaction.transfer()
                 raise failure.primary_error
             except BaseException as exc:
+                if handle.closed:
+                    return
                 handle._listener_failed(exc, task)
                 raise
             client = accepted.stream

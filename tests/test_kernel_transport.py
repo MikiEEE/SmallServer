@@ -297,6 +297,35 @@ class KernelTransportTests(unittest.TestCase):
         run_immediate(SmallServer()._close_watcher(FakeTask(), handle))
         self.assertTrue(handle.finished)
 
+    def test_accept_exception_after_close_is_normal_listener_exit(self) -> None:
+        class FatalAccept(BaseException):
+            pass
+
+        class Runtime:
+            def resume_task(self, task) -> None:
+                pass
+
+        kernel = FakeKernel()
+        transport = KernelTransport(kernel)
+        listener = transport.open_listener("127.0.0.1", 0, 1)
+        handle = ServerHandle(
+            Runtime(), transport, listener, transport.create_wakeup_channel(), ServerConfig()
+        )
+        shutdown_exception = FatalAccept("accept invalidated by shutdown")
+
+        def close_then_fail(raw_listener):
+            handle.close()
+            raise shutdown_exception
+
+        kernel.socket_accept = close_then_fail  # type: ignore[method-assign]
+
+        self.assertIsNone(run_immediate(SmallServer()._accept_loop(FakeTask(), handle)))
+        self.assertTrue(handle.closed)
+        self.assertIsNone(handle.failure)
+        self.assertEqual(kernel.wakeup.notify_calls, 1)
+        run_immediate(SmallServer()._close_watcher(FakeTask(), handle))
+        self.assertTrue(handle.finished)
+
     def test_full_capacity_blocks_on_scheduler_signal_without_accepting(self) -> None:
         class Runtime:
             def resume_task(self, task) -> None:
