@@ -8,7 +8,7 @@ to own task scheduling and all network readiness.
 
 ```bash
 python3 -m pip install -r requirements.txt
-python3 -m pip install -e '.[test]'
+python3 -m pip install -e '.[http2]'
 python3 examples/http2_prior_knowledge.py
 ```
 
@@ -35,12 +35,13 @@ per-stream and per-connection request buffering, response buffering, and frame
 size. `max_control_output_bytes` bounds generated SETTINGS/PING acknowledgments,
 and `reader_frame_batch_size` forces a cooperative yield during continuously
 readable frame floods. Compressed header-block limits are enforced from the
-frame header before payload buffering. Completed request bodies remain charged to the connection budget while
-their handler is running. `handshake_timeout` bounds receipt of the client
-preface and `idle_timeout` bounds inactive established connections; both use
-SmallOS scheduler timers. Requests and responses use the same immutable
-`Request`, `Headers`, and `Response` values as HTTP/1.1. The request version is
-`"HTTP/2"`.
+frame header before payload buffering. Completed request bodies remain charged
+to the connection budget while their handler is running. `handshake_timeout`
+bounds receipt of the client preface. `idle_timeout` is the maximum interval
+without inbound connection bytes or frames; outbound-only response progress
+does not reset it. Both timeouts use SmallOS scheduler timers. Requests and
+responses use the same immutable `Request`, `Headers`, and `Response` values as
+HTTP/1.1. The request version is `"HTTP/2"`.
 
 Peer stream resets cancel the associated handler task without stopping other
 streams. Protocol/resource violations reset the affected stream when possible.
