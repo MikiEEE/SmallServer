@@ -2,8 +2,8 @@
 
 SmallServer is a small, SmallOS-native HTTP framework for Python 3.10+. It
 serves bounded HTTP/1.1 requests and optional cleartext prior-knowledge HTTP/2,
-routes exact paths to async handlers, and provides explicit lifecycle and
-third-party execution controls.
+supports exact and timeout-bounded regex routes, and provides explicit
+lifecycle and third-party execution controls.
 
 ```python
 from smallserver import Response, SmallServer
@@ -33,16 +33,47 @@ Advanced applications can supply their own runtime, schedule the server without
 starting it, and own execution adapters for blocking or asyncio-native
 libraries.
 
-HTTP/2 is an optional hyper-h2 4.x integration. Install only its runtime extra
-with `python3 -m pip install -e '.[http2]'`, then select
-`protocol="http2"` on `listen()` or `serve()`. It supports cleartext prior
-knowledge, multiplexed stream handlers, bounded flow control, and GOAWAY.
+## Optional protocol and routing extras
 
-Current boundaries are intentional: HTTP/1.1 serves one request per
-connection; routes are exact static paths; keep-alive, pipelining, TLS, path
-parameters, WebSockets, HTTP/1.1 h2c upgrade, and automatic protocol detection
-are not implemented. HTTP/2 TLS/ALPN remains deferred until SmallOS exposes a
+HTTP/2 uses the bounded hyper-h2 4.x integration:
+
+```console
+python3 -m pip install -e '.[http2]'
+```
+
+Select `protocol="http2"` on `listen()` or `serve()`. The implementation
+supports cleartext prior knowledge, multiplexed stream handlers, bounded flow
+control, and GOAWAY. HTTP/2 TLS/ALPN remains deferred until SmallOS exposes a
 server-side TLS kernel capability.
+
+Timeout-bounded regex routes require the optional matching engine:
+
+```console
+python3 -m pip install -e '.[regex-routes]'
+```
+
+Static lookup remains dependency-free and takes precedence over regex routes.
+Regex routes use full-path matching, run in registration order, and expose only
+named captures through immutable `request.path_params`:
+
+```python
+@app.get_regex(r"/users/(?P<user_id>[0-9]+)")
+async def get_user(request):
+    return Response.json({"user_id": request.path_params["user_id"]})
+```
+
+Pattern, path, capture, and matching-time limits are configurable with
+`RegexRouteConfig`. A match timeout becomes a sanitized 500 response. An
+optional `route_error_observer` receives only an immutable `RouteErrorEvent`
+with an opaque route ID and category; it never receives the request target,
+headers, body, traceback, or exception graph.
+
+## Current boundaries
+
+HTTP/1.1 serves one request per connection. Keep-alive, pipelining, TLS,
+automatic path templates, WebSockets, HTTP/1.1 h2c upgrade, and automatic
+protocol detection are not implemented. Regex routes are an explicit optional
+route form, not automatic path templates.
 
 ## Documentation
 

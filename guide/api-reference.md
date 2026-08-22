@@ -5,11 +5,13 @@ omit overload detail where prose is clearer.
 
 ## Application
 
-### `SmallServer()`
+### `SmallServer(regex_config=None, *, route_error_observer=None)`
 
 - `get(path)`, `post(path)`, `put(path)`, `patch(path)`, `delete(path)` — route
   decorators for one supported method.
 - `route(path, methods)` — atomic multi-method route decorator.
+- `get_regex`, `post_regex`, `put_regex`, `patch_regex`, `delete_regex`, and
+  `route_regex(pattern, methods)` — optional timeout-bounded regex decorators.
 - `async dispatch(request)` — dispatch an existing `Request`.
 - `listen(host="127.0.0.1", port=8000, config=None, *, protocol="http1",`
   `http2_config=None, runtime=None, start=None)`
@@ -26,7 +28,8 @@ Immutable, case-insensitive mapping with `items()` and `get()`.
 
 ### `Request(method, path, headers, body=b"", version="HTTP/1.1")`
 
-Frozen request value with validated method, path, headers, and byte body.
+Frozen request value with validated method, path, headers, and byte body, plus
+`raw_target`, `query_string`, immutable `path_params`, and `route_pattern`.
 
 ### `Response(status=200, body=b"", headers=Headers())`
 
@@ -48,7 +51,14 @@ requires the `smallserver[http2]` extra.
 ### `ServerHandle`
 
 Read-only properties: `address`, `port`, `closed`, `failure`, `finished`,
-`cleanup_errors`, and `owned_connection_count`.
+`cleanup_errors`, `owned_connection_count`, `dropped_route_error_events`, and
+`route_observer_failures`.
+
+### `RegexRouteConfig(...)`
+
+Finite optional-regex limits. `RouteErrorEvent`, `RouteMatchTimeout`,
+`RoutePathTooLarge`, and `RegexRoutesUnavailable` describe its bounded error
+surface. Runtime regex matching requires `smallserver[regex-routes]`.
 
 Operations: `close()`, `async close_from_task(task)`, and `finalize()`.
 

@@ -1,4 +1,6 @@
 import builtins
+import asyncio
+import importlib.util
 import socket
 import threading
 import unittest
@@ -21,11 +23,25 @@ else:
 
 from SmallPackage import SmallOS, Unix
 
-from smallserver import HTTP2Config, Response, SmallServer
+from smallserver import (
+    HTTP2Config,
+    Headers,
+    Request,
+    Response,
+    RouteErrorEvent,
+    RouteMatchTimeout,
+    SmallServer,
+)
+from smallserver.app import _H2ConnectionState
 from smallserver._transport import KernelTransport, TransportHandle
 from smallserver.errors import ServerConfigurationError
 from smallserver.http2 import H2Protocol, _FrameBudget
-from smallserver.server import ServerConfig, ServerHandle
+from smallserver.server import (
+    RouteObserverChannel,
+    ServerConfig,
+    ServerHandle,
+    run_route_observer,
+)
 from tests.kernel_fakes import FakeKernel, OpaqueHandle
 
 
@@ -500,6 +516,86 @@ class HTTP2ProtocolTests(unittest.TestCase):
         reset_server.queue_response(1, Response(body=b"xx"))
         with self.assertRaisesRegex(ValueError, "control output"):
             reset_server.flush()
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("regex") is not None,
+        "install the smallserver[test] regex extra",
+    )
+    def test_regex_timeout_observer_is_opaque_once_and_sibling_survives(self):
+        secret = "/private-target-should-not-escape"
+        app = SmallServer()
+
+        @app.get_regex(r"/private-target-(?P<value>.*)")
+        async def timed_route(request):
+            return Response.text("must not run")
+
+        @app.get("/healthy")
+        async def healthy(request):
+            return Response.text("healthy")
+
+        class ObserverTask:
+            done = False
+
+            @staticmethod
+            def getID():
+                return 17
+
+            @staticmethod
+            def acceptSignal(signal):
+                return 0
+
+        class HandlerTask:
+            def sendSignal(self, task_id, signal):
+                return 0
+
+        class Protocol:
+            def __init__(self):
+                self.responses = {}
+
+            def queue_response(self, stream_id, response):
+                self.responses[stream_id] = response
+
+            def drop_stream(self, stream_id):
+                raise AssertionError("completed streams must not be dropped")
+
+        observed = []
+
+        def observe(event):
+            observed.append(event)
+            channel.stop()
+
+        channel = RouteObserverChannel(observe, max_events=4)
+        channel.bind(ObserverTask())
+        task = HandlerTask()
+        handle = type(
+            "Handle",
+            (),
+            {"_route_observer_channel": channel, "_owned_tasks": [task]},
+        )()
+        protocol = Protocol()
+        state = _H2ConnectionState(protocol)
+        state.handlers = {1: task, 3: task}
+        hostile = Request("GET", secret, Headers(), version="HTTP/2")
+        sibling = Request("GET", "/healthy", Headers(), version="HTTP/2")
+
+        with patch.object(
+            app._router,
+            "_match",
+            side_effect=RouteMatchTimeout("regex-route-1"),
+        ):
+            asyncio.run(app._http2_handler(task, handle, state, 1, hostile))
+        asyncio.run(app._http2_handler(task, handle, state, 3, sibling))
+        asyncio.run(run_route_observer(ObserverTask(), channel))
+
+        self.assertEqual(protocol.responses[1].status, 500)
+        self.assertEqual(protocol.responses[3].body, b"healthy")
+        self.assertEqual(
+            observed,
+            [RouteErrorEvent("regex-route-1", "route_match_timeout")],
+        )
+        event_graph = repr(observed[0])
+        self.assertNotIn(secret, event_graph)
+        self.assertFalse(hasattr(observed[0], "__traceback__"))
 
 
 @unittest.skipUnless(H2_AVAILABLE, "install the smallserver[test] HTTP/2 extra")

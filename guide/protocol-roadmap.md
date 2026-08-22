@@ -1,7 +1,7 @@
 # Protocol and feature roadmap
 
 This guide documents bounded HTTP/1.1, optional cleartext prior-knowledge
-HTTP/2, exact static routes, shared HTTP values, explicit SmallOS lifecycle
+HTTP/2, exact and optional regex routes, shared HTTP values, explicit SmallOS lifecycle
 control, and application-owned execution adapters.
 
 Feature branches extend this foundation independently. Until such a branch is
@@ -9,10 +9,9 @@ merged into the branch you install, its API is not available.
 
 ## Routing extensions
 
-The regex-routing feature introduces an explicit timeout-bounded regex route
-form and captured path parameters while preserving exact static-route
-precedence. It is not part of this base. Base applications should continue to
-register literal paths and should not assume automatic query parsing.
+The optional regex-routing extra provides timeout-bounded full-path matching
+and named captured path parameters while preserving exact static-route
+precedence. It does not provide automatic path templates or decoding.
 
 ## WebSocket server
 
