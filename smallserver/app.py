@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Awaitable, Callable, Iterable
-from typing import Any, Literal, NoReturn, Protocol, overload
+from typing import Any, Literal, NoReturn, Protocol, cast, overload
 
 from ._transport import (
     KernelTransport,
@@ -44,14 +44,16 @@ class _RuntimeLike(Protocol):
 
     def fork(self, children: Any) -> Any: ...
 
-    def start(self) -> None: ...
-
     def resume_task(self, task: Any) -> Any: ...
 
-    def cancel_task(self, task: Any) -> Any: ...
+
+class _StartableRuntime(_RuntimeLike, Protocol):
+    """Additional lifecycle operation required when SmallServer starts a runtime."""
+
+    def start(self) -> None: ...
 
 
-def _default_runtime_factory() -> _RuntimeLike:
+def _default_runtime_factory() -> _StartableRuntime:
     """Lazily create the supported desktop runtime for managed ``listen``."""
     try:
         from SmallPackage import SmallOS, Unix
@@ -177,7 +179,18 @@ class SmallServer:
         config: ServerConfig | None = None,
         *,
         runtime: _RuntimeLike,
-        start: bool | None = None,
+        start: Literal[False] | None = None,
+    ) -> ServerHandle: ...
+
+    @overload
+    def listen(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 8000,
+        config: ServerConfig | None = None,
+        *,
+        runtime: _StartableRuntime,
+        start: bool,
     ) -> ServerHandle: ...
 
     def listen(
@@ -209,7 +222,7 @@ class SmallServer:
             return handle
         primary_error: BaseException | None = None
         try:
-            runtime.start()
+            cast(_StartableRuntime, runtime).start()
         except BaseException as exc:
             primary_error = exc
         finally:
