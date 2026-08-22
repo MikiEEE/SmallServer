@@ -15,11 +15,11 @@ programming errors.
 
 On HTTP/1.1 and HTTP/2 listeners, a regex match timeout becomes a generic 500.
 A direct `await app.dispatch(request)` instead raises `RouteMatchTimeout`. If a
-network listener has an observer configured, `route_error_observer` receives
-exactly one immutable, traceback-free `RouteErrorEvent` containing only an
-opaque route ID and category. Delivery is bounded and scheduler-local; dropped
-events and observer callback failures are reported by the corresponding
-`ServerHandle` counters.
+network listener has an observer configured, SmallServer attempts to enqueue at
+most one immutable, traceback-free `RouteErrorEvent` containing only an opaque
+route ID and category. Delivery is bounded and scheduler-local, so saturation,
+signal failure, or shutdown may drop the event. Dropped events and observer
+callback failures are reported by the corresponding `ServerHandle` counters.
 
 ## Configuration errors
 
