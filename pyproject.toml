@@ -14,6 +14,12 @@ dependencies = []
 
 [project.optional-dependencies]
 dev = ["build>=1.2"]
+test = [
+    "build>=1.2",
+    "h2>=4,<5",
+    "regex>=2023.10.3,<2027",
+    "wsproto>=1.2,<2",
+]
 
 [tool.setuptools.packages.find]
 include = ["smallserver*"]
