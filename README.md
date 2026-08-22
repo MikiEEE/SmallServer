@@ -21,7 +21,9 @@ The current package provides an HTTP/1.1 baseline over a SmallOS runtime. It can
 - parse one `Content-Length` HTTP/1.1 request per connection and close after
   its response.
 
-Keep-alive/pipelining, TLS, automatic path templates, and HTTP/2 are not
+RFC 6455 WebSockets over HTTP/1.1 Upgrade are available through the optional
+`websocket` extra. Keep-alive/pipelining, TLS, automatic path templates,
+compression, RFC 8441 WebSockets over HTTP/2, and HTTP/2 itself are not
 implemented yet.
 
 ## Install for development
@@ -39,6 +41,12 @@ python3 -m pip install -e '.[regex-routes]'
 ```
 
 Static routing neither imports nor requires that dependency.
+
+Install the optional WebSocket protocol engine when serving WebSocket routes:
+
+```bash
+python3 -m pip install -e '.[websocket]'
+```
 
 SmallOS is installed from the canonical `master` branch in `requirements.txt`.
 It owns scheduling, socket readiness, and foreign execution adapters.
@@ -205,6 +213,29 @@ async def delete_widgets(request: Request) -> Response:
 Static route lookup is dictionary-based and always takes precedence over a
 regex route for the same method and path. Richer lifecycle hooks are deferred;
 the current `ServerHandle` provides explicit shutdown.
+
+## WebSocket routes
+
+Register WebSockets independently from HTTP routes. The same path may also
+have a normal GET handler because only an Upgrade candidate enters the
+WebSocket route table.
+
+```python
+from smallserver import WebSocket
+
+@app.websocket("/echo")
+async def echo(socket: WebSocket) -> None:
+    await socket.accept()
+    async for message in socket:
+        if message.is_text:
+            await socket.send_text(message.text)
+        else:
+            await socket.send_bytes(message.bytes)
+```
+
+See [`guide/websockets.md`](guide/websockets.md) and the runnable
+[`examples/websocket_echo.py`](examples/websocket_echo.py) for origin,
+subprotocol, capacity, and lifecycle details.
 
 ## Define regular-expression routes
 

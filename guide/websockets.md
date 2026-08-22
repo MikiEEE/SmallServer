@@ -1,0 +1,52 @@
+# WebSockets
+
+Install the optional protocol engine before serving WebSocket routes:
+
+```bash
+python3 -m pip install -e '.[websocket]'
+```
+
+WebSocket routes use HTTP/1.1 Upgrade while SmallOS continues to own task
+scheduling and socket readiness. A normal `GET` route may use the same path;
+requests without Upgrade headers remain ordinary HTTP requests.
+
+```python
+from smallserver import SmallServer, WebSocket
+
+app = SmallServer()
+
+@app.websocket(
+    "/chat",
+    origins={"https://app.example.com"},
+    subprotocols=("chat.v1",),
+)
+async def chat(socket: WebSocket) -> None:
+    await socket.accept(subprotocol="chat.v1")
+    async for message in socket:
+        if message.is_text:
+            await socket.send_text(message.text)
+        else:
+            await socket.send_bytes(message.bytes)
+
+app.listen()
+```
+
+The application must explicitly call `accept()` or `reject()` before using
+message operations. Returning without either decision sends a sanitized 403.
+Text, binary, fragmented messages, Ping/Pong, and Close are supported. Queue,
+frame, message, connection, handshake, idle, Pong, and close limits are finite
+and configurable through `WebSocketConfig`.
+
+An origin allowlist is strongly recommended when browser credentials or
+cookies are involved. A selected subprotocol must have been offered by the
+client and allowed by the route. Outbound saturation raises
+`WebSocketCapacityError`; peer or server closure raises `WebSocketDisconnect`
+from receive operations.
+
+Send calls complete after the serialized frame bytes have been flushed through
+the connection writer. They do not mean the peer application has processed the
+message.
+
+This release does not implement `wss://` termination, compression, custom
+extensions, or RFC 8441 WebSockets over HTTP/2. Put TLS at a trusted reverse
+proxy until SmallServer gains a native TLS boundary.
