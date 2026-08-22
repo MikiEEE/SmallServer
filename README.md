@@ -65,6 +65,34 @@ async def health(request):
 app.listen(host="127.0.0.1", port=8000)
 ```
 
+### Configure the managed SmallOS runtime
+
+When `listen()` creates the runtime, `ServerConfig.managed_runtime` passes the
+relevant scheduler and client defaults into SmallOS before the listener binds:
+
+```python
+from smallserver import ManagedRuntimeConfig, ServerConfig
+
+config = ServerConfig(
+    max_connections=200,
+    managed_runtime=ManagedRuntimeConfig(
+        task_capacity=512,
+        priority_levels=8,
+        io_buffer_length=2048,
+        eternal_watchers=False,
+        client_defaults={
+            "http": {"max_response_size": 8 * 1024 * 1024},
+        },
+    ),
+)
+
+app.listen(host="127.0.0.1", port=8000, config=config)
+```
+
+This bridge is only for SmallServer-owned runtimes. If you supply `runtime=`,
+configure it directly with `SmallOS(config=...)`; SmallServer rejects
+`managed_runtime` rather than mutating caller-owned scheduler state.
+
 Managed `listen()` blocks and catches Ctrl-C after closing its listener, wakeup
 channel, connections, and server tasks. It returns the closed `ServerHandle`,
 whose cached `address` and `port` remain available for diagnostics. Each

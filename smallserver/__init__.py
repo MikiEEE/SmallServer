@@ -10,6 +10,7 @@ from .errors import (
     ServerStartupError,
 )
 from .http import Headers, Request, Response
+from .runtime import ManagedRuntimeConfig
 from .server import ServerConfig, ServerHandle
 
 if TYPE_CHECKING:
@@ -31,6 +32,7 @@ __all__ = [
     "AdapterShutdownError",
     "Headers",
     "HTTPError",
+    "ManagedRuntimeConfig",
     "Request",
     "Response",
     "ServerConfig",
