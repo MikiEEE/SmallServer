@@ -21,10 +21,11 @@ that commit, a generated changelog, and GitHub artifact provenance.
    the distributions, creates the `v<version>` tag, and creates the GitHub
    release.
 
-If another commit reaches `main` first, the stale workflow exits without
-releasing; the newer commit's CI run owns the release. If the version tag
-already exists, release creation fails visibly and the next release pull
-request must bump `project.version`.
+Release runs are serialized. If another commit reaches `main` before either
+the initial validation check or the final pre-publish check, the stale workflow
+exits without releasing; the newer commit's CI run owns the release. If the
+version tag already exists, release creation fails visibly and the next release
+pull request must bump `project.version`.
 
 ## Local release checks
 

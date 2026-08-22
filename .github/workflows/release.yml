@@ -13,7 +13,7 @@ permissions:
 
 concurrency:
   group: release-main
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   release:
@@ -77,13 +77,24 @@ jobs:
           python -m pip install --upgrade build twine
           python -m build
           python -m twine check dist/*
-      - name: Attest release artifacts
+      - id: publish
+        name: Confirm main is unchanged before publishing
         if: steps.main.outputs.current == 'true'
+        run: |
+          current_main="$(git ls-remote origin refs/heads/main | awk '{print $1}')"
+          if [ "$current_main" != "$VALIDATED_SHA" ]; then
+            echo "A newer main commit exists; its CI run owns the next release."
+            echo "current=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Attest release artifacts
+        if: steps.publish.outputs.current == 'true'
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: dist/*
       - name: Create tag and GitHub release
-        if: steps.main.outputs.current == 'true'
+        if: steps.publish.outputs.current == 'true'
         env:
           RELEASE_TAG: ${{ steps.version.outputs.tag }}
         run: >-
