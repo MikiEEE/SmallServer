@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+from contextlib import nullcontext
 import os
 from pathlib import Path
 import subprocess
@@ -127,6 +128,39 @@ class ServerLifecycleTests(unittest.TestCase):
         next_handle = app.listen(runtime=FakeRuntime(), port=0)
         next_handle.finalize()
 
+    def test_runtime_failure_retains_invocation_until_cleanup_retry(self) -> None:
+        runtime = FakeRuntime()
+        primary = RuntimeError("scheduler failed")
+        runtime.start_error = primary
+        runtime.kernel.close_failures[id(runtime.kernel.listener)] = 1
+        app = SmallServer()
+
+        with self.assertRaises(ServerStartupError) as raised:
+            app.listen(runtime=runtime, start=True, port=0)
+
+        cleanup = raised.exception
+        self.assertIs(cleanup.primary_error, primary)
+        with self.assertRaisesRegex(RuntimeError, "active listener"):
+            app.serve(FakeRuntime(), port=0)
+        self.assertTrue(cleanup.retry_cleanup())
+        next_handle = app.serve(FakeRuntime(), port=0)
+        next_handle.finalize()
+
+    def test_normal_runtime_return_exposes_unfinished_handle_for_retry(self) -> None:
+        runtime = FakeRuntime()
+        runtime.kernel.close_failures[id(runtime.kernel.listener)] = 1
+        app = SmallServer()
+
+        handle = app.listen(runtime=runtime, start=True, port=0)
+
+        self.assertFalse(handle.finished)
+        with self.assertRaisesRegex(RuntimeError, "active listener"):
+            app.serve(FakeRuntime(), port=0)
+        handle.finalize()
+        self.assertTrue(handle.finished)
+        next_handle = app.serve(FakeRuntime(), port=0)
+        next_handle.finalize()
+
     def test_managed_keyboard_interrupt_is_swallowed_after_cleanup(self) -> None:
         runtime = FakeRuntime()
         runtime.start_error = KeyboardInterrupt()
@@ -148,6 +182,35 @@ class ServerLifecycleTests(unittest.TestCase):
         self.assertEqual(runtime.kernel.wakeup.close_calls, 1)
         self.assertEqual([item.name for item in runtime.kernel.closed], ["listener"])
 
+    def test_system_exit_identity_survives_lifecycle_cleanup_failure(self) -> None:
+        for managed in (False, True):
+            with self.subTest(managed=managed):
+                runtime = FakeRuntime()
+                primary = SystemExit(17)
+                runtime.start_error = primary
+                runtime.kernel.close_failures[id(runtime.kernel.listener)] = 1
+                app = SmallServer()
+
+                context = (
+                    patch("smallserver.app._default_runtime_factory", return_value=runtime)
+                    if managed
+                    else nullcontext()
+                )
+                with context:
+                    with self.assertRaises(SystemExit) as raised:
+                        if managed:
+                            app.listen(port=0)
+                        else:
+                            app.listen(runtime=runtime, start=True, port=0)
+
+                self.assertIs(raised.exception, primary)
+                cleanup = raised.exception.__cause__
+                self.assertIsInstance(cleanup, ServerStartupError)
+                assert isinstance(cleanup, ServerStartupError)
+                with self.assertRaisesRegex(RuntimeError, "active listener"):
+                    app.serve(FakeRuntime(), port=0)
+                self.assertTrue(cleanup.retry_cleanup())
+
     def test_invalid_ownership_and_runtime_fail_before_binding(self) -> None:
         with patch("smallserver.app._default_runtime_factory") as factory:
             with self.assertRaisesRegex(ValueError, "caller-supplied"):
@@ -166,6 +229,24 @@ class ServerLifecycleTests(unittest.TestCase):
 
         with self.assertRaisesRegex(TypeError, "boolean"):
             SmallServer().listen(runtime=FakeRuntime(), start=1)  # type: ignore[arg-type]
+
+    def test_acquisition_cleanup_retains_invocation_until_retry(self) -> None:
+        runtime = FakeRuntime()
+        primary = RuntimeError("listen setup failed")
+        runtime.kernel.operation_errors["listen"] = primary
+        runtime.kernel.close_failures[id(runtime.kernel.listener)] = 1
+        app = SmallServer()
+
+        with self.assertRaises(ServerStartupError) as raised:
+            app.serve(runtime, port=0)
+
+        cleanup = raised.exception
+        self.assertIs(cleanup.primary_error, primary)
+        with self.assertRaisesRegex(RuntimeError, "active listener"):
+            app.serve(FakeRuntime(), port=0)
+        self.assertTrue(cleanup.retry_cleanup())
+        next_handle = app.serve(FakeRuntime(), port=0)
+        next_handle.finalize()
 
     def test_concurrent_invocation_is_rejected_and_sequential_reuse_succeeds(self) -> None:
         app = SmallServer()
