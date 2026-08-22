@@ -46,6 +46,7 @@ from .websocket import (
     WebSocketUnavailable,
     _WebSocketRoute,
     _WebSocketState,
+    _is_http_token,
     _is_upgrade_attempt,
     _validate_upgrade,
     run_websocket_connection,
@@ -243,9 +244,7 @@ class SmallServer:
             raise TypeError("WebSocket subprotocols must be an iterable of tokens")
         protocols = tuple(dict.fromkeys(subprotocols))
         if any(
-            not isinstance(protocol, str)
-            or not protocol
-            or any(character in protocol for character in "()<>@,;:\\\"/[]?={} \t")
+            not isinstance(protocol, str) or not _is_http_token(protocol)
             for protocol in protocols
         ):
             raise ValueError("WebSocket subprotocols must be valid HTTP tokens")
