@@ -9,8 +9,10 @@ import unittest
 from unittest.mock import patch
 
 from SmallPackage import SmallOS, SmallTask, SmallWebSocketClient, Unix
+from SmallPackage.adapters.threads import ThreadAdapter
 
 from smallserver import (
+    AdapterRegistry,
     Headers,
     Request,
     Response,
@@ -18,13 +20,20 @@ from smallserver import (
     WebSocket,
     WebSocketCapacityError,
     WebSocketConfig,
+    WebSocketDisconnect,
     WebSocketUnavailable,
 )
 from smallserver.websocket import (
     _FrameGuard,
     _WebSocketState,
     _WebSocketRoute,
+    _drain_protocol_events,
+    _handle_pong,
     _load_wsproto,
+    _receive_protocol_data,
+    _run_deadlines,
+    _run_handler,
+    _run_writer,
     _validate_upgrade,
 )
 
@@ -48,6 +57,55 @@ async def unused_handler(socket: WebSocket) -> None:
     await socket.reject(Response(status=403))
 
 
+class _RecordingTransport:
+    def __init__(self) -> None:
+        self.send_calls = 0
+        self.payloads: list[bytes] = []
+
+    async def send_all(self, task, client, payload: bytes) -> None:
+        self.send_calls += 1
+        self.payloads.append(payload)
+
+
+class _BlockingTransport(_RecordingTransport):
+    async def send_all(self, task, client, payload: bytes) -> None:
+        self.send_calls += 1
+        self.payloads.append(payload)
+        await task.wait_signal(28)
+
+
+def _make_state(
+    runtime,
+    transport,
+    handler,
+    *,
+    config: WebSocketConfig | None = None,
+) -> _WebSocketState:
+    return _WebSocketState(
+        runtime,
+        transport,
+        object(),
+        upgrade_request(),
+        _WebSocketRoute(handler, None, ()),
+        config or WebSocketConfig(),
+        b"",
+    )
+
+
+def _make_accepted_state(
+    runtime,
+    transport,
+    handler,
+    *,
+    config: WebSocketConfig | None = None,
+) -> _WebSocketState:
+    state = _make_state(runtime, transport, handler, config=config)
+    state.protocol = state.api.Connection(state.api.ConnectionType.SERVER)
+    state.accepted = True
+    state.handshake_state = "accepted"
+    return state
+
+
 class WebSocketProtocolTests(unittest.TestCase):
     def test_config_rejects_unbounded_or_inconsistent_limits(self) -> None:
         with self.assertRaisesRegex(ValueError, "max_message_bytes"):
@@ -56,6 +114,8 @@ class WebSocketProtocolTests(unittest.TestCase):
             WebSocketConfig(max_frame_payload_bytes=2, max_message_bytes=1)
         with self.assertRaisesRegex(ValueError, "idle_timeout"):
             WebSocketConfig(idle_timeout=float("inf"))
+        with self.assertRaisesRegex(ValueError, "write_timeout"):
+            WebSocketConfig(write_timeout=0)
 
     def test_registration_is_lazy_and_coexists_with_get(self) -> None:
         app = SmallServer()
@@ -122,6 +182,270 @@ class WebSocketProtocolTests(unittest.TestCase):
                 upgrade_request(Origin="https://allowed.example"), route
             )
         )
+
+    def test_subprotocol_tokens_are_ascii(self) -> None:
+        app = SmallServer()
+        for invalid in ("chat:v1", "café", "chat v1", ""):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(ValueError, "HTTP tokens"):
+                    app.websocket(
+                        "/invalid-{}".format(len(app._websocket_routes)),
+                        subprotocols=(invalid,),
+                    )
+
+        route = _WebSocketRoute(unused_handler, None, ("chat.v1",))
+        for offered in ("chat:v1", "café", ","):
+            with self.subTest(offered=offered):
+                invalid = _validate_upgrade(
+                    upgrade_request(**{"Sec-WebSocket-Protocol": offered}), route
+                )
+                self.assertIsNotNone(invalid)
+                assert invalid is not None
+                self.assertEqual(invalid.status, 400)
+
+    @unittest.skipUnless(HAS_WSPROTO, "websocket extra is not installed")
+    def test_extensions_cannot_be_selected_in_accept_response(self) -> None:
+        runtime = SmallOS().setKernel(Unix())
+        transport = _RecordingTransport()
+        state = _make_state(runtime, transport, unused_handler)
+        outcome: list[BaseException] = []
+
+        async def accept_with_extension(task) -> None:
+            try:
+                await WebSocket(state).accept(
+                    headers={"Sec-WebSocket-Extensions": "permessage-deflate"}
+                )
+            except BaseException as exc:
+                outcome.append(exc)
+
+        attempt = SmallTask(2, accept_with_extension, name="extension-rejection")
+        runtime.fork(attempt)
+        runtime.start()
+        self.assertIsInstance(outcome[0], ValueError)
+        self.assertEqual(state.handshake_state, "pending")
+        self.assertEqual(transport.send_calls, 0)
+
+    @unittest.skipUnless(HAS_WSPROTO, "websocket extra is not installed")
+    def test_atomic_handshake_timeout_is_terminal_while_send_is_blocked(self) -> None:
+        runtime = SmallOS().setKernel(Unix())
+        transport = _BlockingTransport()
+        config = WebSocketConfig(
+            handshake_timeout=0.02,
+            idle_timeout=1,
+            close_timeout=0.02,
+            deadline_resolution=0.005,
+        )
+        state = _make_state(runtime, transport, unused_handler, config=config)
+        outcomes: list[BaseException] = []
+
+        async def accept_job(task) -> None:
+            state.handler_task = task
+            try:
+                await WebSocket(state).accept()
+            except BaseException as exc:
+                outcomes.append(exc)
+
+        accept_task = SmallTask(2, accept_job, name="blocked-handshake")
+        deadline_task = SmallTask(
+            2, _run_deadlines, args=(state,), name="handshake-deadline"
+        )
+        state.deadline_task = deadline_task
+        runtime.fork([accept_task, deadline_task])
+        runtime.start()
+
+        self.assertEqual(transport.send_calls, 1)
+        self.assertEqual(state.handshake_state, "failed")
+        self.assertFalse(state.accepted)
+        self.assertFalse(state.rejected)
+        self.assertIsNotNone(state.handshake_error)
+
+        async def retry_job(task) -> None:
+            try:
+                await WebSocket(state).accept()
+            except BaseException as exc:
+                outcomes.append(exc)
+
+        retry_task = SmallTask(2, retry_job, name="handshake-retry")
+        runtime.fork(retry_task)
+        runtime.start()
+        self.assertIsInstance(outcomes[-1], Exception)
+        self.assertIn("already decided", str(outcomes[-1]))
+        self.assertEqual(transport.send_calls, 1)
+
+        pending = _make_state(
+            SmallOS().setKernel(Unix()), _RecordingTransport(), unused_handler
+        )
+        pending.request_shutdown()
+        self.assertEqual(pending.handshake_state, "failed")
+        self.assertIsInstance(pending.handshake_error, WebSocketDisconnect)
+
+    @unittest.skipUnless(HAS_WSPROTO, "websocket extra is not installed")
+    def test_ping_is_armed_before_send_and_only_matching_pong_clears(self) -> None:
+        runtime = SmallOS().setKernel(Unix())
+        state = _make_accepted_state(runtime, _RecordingTransport(), unused_handler)
+        observations: list[tuple[object, ...]] = []
+        _handle_pong(state, b"unsolicited")
+        self.assertIsNone(state._pending_ping_generation)
+
+        async def immediate_pong(event, size, *, wait):
+            observations.append(
+                (
+                    state._pending_ping_generation,
+                    state._pending_ping_payload,
+                    state.pong_deadline is not None,
+                )
+            )
+            _handle_pong(state, b"wrong")
+            observations.append((state._pending_ping_generation,))
+            _handle_pong(state, b"probe")
+
+        state._enqueue = immediate_pong
+
+        async def ping_job(task) -> None:
+            await WebSocket(state).ping(b"probe")
+
+        ping_task = SmallTask(2, ping_job, name="fast-pong")
+        runtime.fork(ping_task)
+        runtime.start()
+        self.assertIsNone(ping_task.exception)
+        self.assertEqual(observations[0][1:], (b"probe", True))
+        self.assertIsNotNone(observations[1][0])
+        self.assertIsNone(state._pending_ping_generation)
+        self.assertIsNone(state.pong_deadline)
+
+    @unittest.skipUnless(HAS_WSPROTO, "websocket extra is not installed")
+    def test_fragment_metadata_is_coalesced_and_close_reasons_are_sanitized(self) -> None:
+        api = _load_wsproto()
+        runtime = SmallOS().setKernel(Unix())
+        state = _make_accepted_state(runtime, _RecordingTransport(), unused_handler)
+        client = api.Connection(api.ConnectionType.CLIENT)
+
+        _receive_protocol_data(
+            state,
+            client.send(
+                api.TextMessage(data="a", message_finished=False)
+            ),
+        )
+        _drain_protocol_events(state)
+        for _ in range(2048):
+            _receive_protocol_data(
+                state,
+                client.send(api.TextMessage(data="", message_finished=False)),
+            )
+            _drain_protocol_events(state)
+            self.assertEqual(len(state._message_buffer), 1)
+        _receive_protocol_data(
+            state,
+            client.send(api.TextMessage(data="b", message_finished=True)),
+        )
+        _drain_protocol_events(state)
+        self.assertEqual(state.inbox.popleft().text, "ab")
+
+        peer_close_state = _make_accepted_state(
+            runtime, _RecordingTransport(), unused_handler
+        )
+        peer = api.Connection(api.ConnectionType.CLIENT)
+        _receive_protocol_data(
+            peer_close_state,
+            peer.send(api.CloseConnection(code=1000, reason="peer detail")),
+        )
+        self.assertTrue(_drain_protocol_events(peer_close_state))
+        command = peer_close_state.outbox.popleft()
+        self.assertEqual(command.size, 2 + len(b"peer detail"))
+        self.assertEqual(command.event.reason, "peer detail")
+
+        protocol_error_state = _make_accepted_state(
+            runtime, _RecordingTransport(), unused_handler
+        )
+        _receive_protocol_data(protocol_error_state, b"\x83\x80mask")
+        self.assertTrue(_drain_protocol_events(protocol_error_state))
+        generated = protocol_error_state.outbox.popleft()
+        self.assertEqual(int(generated.event.code), 1002)
+        self.assertEqual(generated.event.reason, "protocol error")
+        self.assertEqual(protocol_error_state.disconnect.reason, "protocol error")
+
+    @unittest.skipUnless(HAS_WSPROTO, "websocket extra is not installed")
+    def test_slow_writer_is_interrupted_by_bounded_deadlines(self) -> None:
+        runtime = SmallOS().setKernel(Unix())
+        config = WebSocketConfig(
+            idle_timeout=1,
+            write_timeout=0.02,
+            close_timeout=0.02,
+            pong_timeout=1,
+            deadline_resolution=0.005,
+        )
+        state = _make_accepted_state(
+            runtime, _BlockingTransport(), unused_handler, config=config
+        )
+        outcomes: list[str] = []
+
+        async def sender(task) -> None:
+            state.handler_task = task
+            try:
+                await WebSocket(state).send_text("blocked")
+            finally:
+                outcomes.append("sender-finished")
+
+        sender_task = SmallTask(2, sender, name="blocked-sender")
+        writer_task = SmallTask(2, _run_writer, args=(state,), name="blocked-writer")
+        deadline_task = SmallTask(2, _run_deadlines, args=(state,), name="write-deadline")
+        state.writer_task = writer_task
+        state.deadline_task = deadline_task
+        started = time.monotonic()
+        runtime.fork([sender_task, writer_task, deadline_task])
+        runtime.start()
+
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertEqual(outcomes, ["sender-finished"])
+        self.assertIsNotNone(state.disconnect)
+        self.assertEqual(state.disconnect.code, 1006)
+        self.assertEqual(state.disconnect.reason, "write timed out")
+        self.assertEqual(state.outbox_bytes, 0)
+        self.assertEqual(len(state.outbox), 0)
+
+    @unittest.skipUnless(HAS_WSPROTO, "websocket extra is not installed")
+    def test_critical_handler_failures_keep_identity_and_ordinary_errors_translate(self) -> None:
+        for critical in (KeyboardInterrupt("stop"), SystemExit(7)):
+            with self.subTest(critical=type(critical).__name__):
+                runtime = SmallOS().setKernel(Unix())
+
+                async def critical_handler(socket, error=critical) -> None:
+                    raise error
+
+                state = _make_state(
+                    runtime, _RecordingTransport(), critical_handler
+                )
+                handler_task = SmallTask(
+                    2, _run_handler, args=(state,), name="critical-handler"
+                )
+                state.handler_task = handler_task
+                runtime.fork(handler_task)
+                try:
+                    runtime.start()
+                except (KeyboardInterrupt, SystemExit) as caught:
+                    self.assertIs(caught, critical)
+                else:
+                    self.fail("critical handler exception did not escape unchanged")
+                self.assertIs(state.fatal_error, critical)
+                self.assertEqual(state.handshake_state, "failed")
+
+        runtime = SmallOS().setKernel(Unix())
+
+        async def ordinary_handler(socket) -> None:
+            raise RuntimeError("private detail")
+
+        transport = _RecordingTransport()
+        state = _make_state(runtime, transport, ordinary_handler)
+        handler_task = SmallTask(
+            2, _run_handler, args=(state,), name="ordinary-handler"
+        )
+        state.handler_task = handler_task
+        runtime.fork(handler_task)
+        runtime.start()
+        self.assertIsNone(handler_task.exception)
+        self.assertTrue(state.rejected)
+        self.assertIn(b"HTTP/1.1 500 Internal Server Error", transport.payloads[0])
+        self.assertNotIn(b"private detail", transport.payloads[0])
 
     @unittest.skipUnless(HAS_WSPROTO, "websocket extra is not installed")
     def test_frame_guard_bounds_declared_length_before_payload(self) -> None:
@@ -517,7 +841,7 @@ class WebSocketLoopbackTests(unittest.TestCase):
         @app.websocket("/idle-timeout")
         async def idle_timeout(websocket: WebSocket) -> None:
             await websocket.accept()
-            await websocket.receive()
+            await runtime.cursor.sleep(5)
 
         @app.websocket("/pong-timeout")
         async def pong_timeout(websocket: WebSocket) -> None:
@@ -610,6 +934,84 @@ class WebSocketLoopbackTests(unittest.TestCase):
         self.assertEqual(outcomes["ping_payload"], b"deadline")
         self.assertEqual(outcomes["pong_code"], 1002)
         self.assertTrue(server.finished)
+
+    def test_idle_deadline_cancels_adapter_waiting_handler(self) -> None:
+        runtime = SmallOS().setKernel(Unix())
+        release = threading.Event()
+        entered = threading.Event()
+        app = SmallServer(
+            websocket_config=WebSocketConfig(
+                idle_timeout=0.05,
+                close_timeout=0.1,
+                deadline_resolution=0.01,
+            )
+        )
+        errors: list[BaseException] = []
+
+        def blocking_work() -> None:
+            entered.set()
+            if not release.wait(2):
+                raise TimeoutError("adapter worker was not released")
+
+        with AdapterRegistry(
+            blocking=ThreadAdapter(max_workers=1, max_pending=1)
+        ) as services:
+
+            @app.websocket("/adapter-idle")
+            async def adapter_idle(websocket: WebSocket) -> None:
+                await websocket.accept()
+                await services.call("blocking", blocking_work)
+
+            try:
+                server = app.serve(runtime, host="127.0.0.1", port=0)
+            except PermissionError:
+                self.skipTest("the current sandbox does not permit loopback TCP binds")
+
+            close_codes: list[int | None] = []
+
+            def client_work() -> None:
+                try:
+                    with socket.create_connection(
+                        ("127.0.0.1", server.port), timeout=3
+                    ) as stream:
+                        stream.sendall(
+                            b"GET /adapter-idle HTTP/1.1\r\nHost: localhost\r\n"
+                            b"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                            b"Sec-WebSocket-Version: 13\r\n"
+                            b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+                        )
+                        response = b""
+                        while b"\r\n\r\n" not in response:
+                            response += stream.recv(4096)
+                        if not entered.wait(1):
+                            raise TimeoutError("adapter handler did not start")
+                        api = _load_wsproto()
+                        client = api.Connection(api.ConnectionType.CLIENT)
+                        events = _receive_events(
+                            stream, client, api.CloseConnection
+                        )
+                        close = next(
+                            event
+                            for event in events
+                            if isinstance(event, api.CloseConnection)
+                        )
+                        close_codes.append(close.code)
+                        stream.sendall(client.send(close.response()))
+                except BaseException as exc:
+                    errors.append(exc)
+                finally:
+                    release.set()
+                    server.close()
+
+            worker = threading.Thread(target=client_work, daemon=True)
+            worker.start()
+            runtime.start()
+            worker.join(timeout=5)
+
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(close_codes, [1001])
+            self.assertTrue(server.finished)
 
     def test_server_shutdown_attempts_close_and_releases_children(self) -> None:
         api = _load_wsproto()
