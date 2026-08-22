@@ -26,7 +26,7 @@ yet. HTTP/2 currently supports cleartext prior knowledge only.
 
 ```bash
 python3 -m pip install -r requirements.txt
-python3 -m pip install -e .
+python3 -m pip install -e '.[test]'
 python3 -m unittest discover -s tests -v
 ```
 
@@ -92,7 +92,11 @@ app.listen(
     host="127.0.0.1",
     port=8000,
     protocol="http2",
-    http2_config=HTTP2Config(max_concurrent_streams=32),
+    http2_config=HTTP2Config(
+        max_concurrent_streams=32,
+        handshake_timeout=10,
+        idle_timeout=60,
+    ),
 )
 ```
 
