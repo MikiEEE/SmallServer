@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import re
 from types import MappingProxyType
@@ -78,7 +78,7 @@ class Response:
 
     status: int = 200
     body: bytes = b""
-    headers: Headers = Headers()
+    headers: Headers = field(default_factory=Headers)
 
     def __post_init__(self) -> None:
         if not isinstance(self.status, int) or not 100 <= self.status <= 599:
