@@ -214,3 +214,11 @@ python3 -m pip install -r requirements.txt
 ```
 
 SmallOS's normalized distribution name is currently unavailable for public package installation; SmallServer must not claim a PyPI dependency until that is resolved.
+
+## Releases
+
+Release pull requests merge from `develop` into `main` with a new
+`project.version`. Successful CI on that exact `main` commit creates a tagged
+GitHub release containing checked wheel and source archives. See
+[`RELEASING.md`](RELEASING.md) for the complete process and the current reason
+PyPI publication remains disabled.
