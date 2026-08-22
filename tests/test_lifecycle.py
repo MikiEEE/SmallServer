@@ -8,7 +8,7 @@ import sys
 import unittest
 from unittest.mock import patch
 
-from smallserver import ServerConfigurationError, SmallServer
+from smallserver import ServerConfigurationError, ServerStartupError, SmallServer
 from smallserver._transport import TransportHandle
 from smallserver.server import ServerHandle
 
@@ -178,6 +178,70 @@ class ServerLifecycleTests(unittest.TestCase):
         second = app.serve(FakeRuntime(), port=0)
         second.finalize()
         self.assertTrue(second.closed)
+
+    def test_cleanup_failure_retains_invocation_until_retry_finishes(self) -> None:
+        runtime = FakeRuntime()
+        app = SmallServer()
+        handle = app.serve(runtime, port=0)
+        runtime.kernel.close_failures[id(runtime.kernel.listener)] = 1
+
+        handle.finalize()
+
+        self.assertFalse(handle.finished)
+        self.assertEqual(len(handle.cleanup_errors), 1)
+        self.assertEqual(runtime.cancelled, runtime.forked)
+        with self.assertRaisesRegex(RuntimeError, "active listener"):
+            app.serve(FakeRuntime(), port=0)
+
+        handle.finalize()
+
+        self.assertTrue(handle.finished)
+        self.assertEqual(handle.cleanup_errors, ())
+        # Cleanup retries do not cancel owned or unrelated tasks a second time.
+        self.assertEqual(runtime.cancelled, runtime.forked)
+        self.assertNotIn(runtime.unrelated_task, runtime.cancelled)
+        next_handle = app.serve(FakeRuntime(), port=0)
+        next_handle.finalize()
+
+    def test_startup_failure_exposes_retained_handle_for_cleanup_retry(self) -> None:
+        class FailingForkRuntime(FakeRuntime):
+            def fork(self, children) -> object:
+                super().fork(children)
+                raise RuntimeError("fork failed")
+
+        runtime = FailingForkRuntime()
+        runtime.kernel.close_failures[id(runtime.kernel.listener)] = 1
+        app = SmallServer()
+
+        with self.assertRaises(ServerStartupError) as raised:
+            app.serve(runtime, port=0)
+
+        cleanup = raised.exception
+        self.assertEqual(str(cleanup.primary_error), "fork failed")
+        self.assertEqual(len(cleanup.cleanup_errors), 1)
+        with self.assertRaisesRegex(RuntimeError, "active listener"):
+            app.serve(FakeRuntime(), port=0)
+        self.assertTrue(cleanup.retry_cleanup())
+        next_handle = app.serve(FakeRuntime(), port=0)
+        next_handle.finalize()
+
+    def test_managed_interrupt_propagates_when_cleanup_is_incomplete(self) -> None:
+        runtime = FakeRuntime()
+        runtime.start_error = KeyboardInterrupt()
+        runtime.kernel.close_failures[id(runtime.kernel.listener)] = 1
+        app = SmallServer()
+
+        with patch("smallserver.app._default_runtime_factory", return_value=runtime):
+            with self.assertRaises(KeyboardInterrupt) as raised:
+                app.listen(port=0)
+
+        cleanup = raised.exception.__cause__
+        self.assertIsInstance(cleanup, ServerStartupError)
+        assert isinstance(cleanup, ServerStartupError)
+        self.assertIs(cleanup.primary_error, raised.exception)
+        with self.assertRaisesRegex(RuntimeError, "active listener"):
+            app.serve(FakeRuntime(), port=0)
+        self.assertTrue(cleanup.retry_cleanup())
 
     def test_finalization_is_idempotent_with_live_connections(self) -> None:
         runtime = FakeRuntime()
