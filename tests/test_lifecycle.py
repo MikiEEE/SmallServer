@@ -83,6 +83,25 @@ class ServerLifecycleTests(unittest.TestCase):
         self.assertFalse(handle.closed)
         handle.finalize()
 
+    def test_no_wakeup_runtime_can_be_owner_finalized_and_reused(self) -> None:
+        runtime = FakeRuntime(FakeKernel(wakeup_supported=False))
+        app = SmallServer()
+        handle = app.listen(runtime=runtime, port=0)
+
+        self.assertEqual(len(runtime.forked), 1)
+        self.assertIsNone(handle._wakeup)
+        with self.assertRaisesRegex(RuntimeError, "outside its scheduler"):
+            handle.close()
+
+        handle.finalize()
+        self.assertTrue(handle.closed)
+        self.assertEqual(runtime.cancelled, runtime.forked)
+        self.assertEqual(runtime.kernel.closed, [runtime.kernel.listener])
+
+        next_runtime = FakeRuntime(FakeKernel(wakeup_supported=False))
+        next_handle = app.listen(runtime=next_runtime, port=0)
+        next_handle.finalize()
+
     def test_supplied_runtime_start_true_starts_once_and_returns_closed_handle(self) -> None:
         runtime = FakeRuntime()
         handle = SmallServer().listen(runtime=runtime, start=True, port=0)

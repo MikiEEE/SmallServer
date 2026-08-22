@@ -133,9 +133,12 @@ compatibility API. `listen(runtime=runtime, start=True)` starts the supplied
 runtime exactly once and finalizes only server-owned resources when it exits;
 the runtime itself still belongs to the caller.
 
-While the scheduler is running, `server.close()` is the thread-safe shutdown
-signal. After a manually started scheduler has already exited or failed,
-`server.finalize()` is the idempotent owner-thread cleanup operation.
+While the scheduler is running on a kernel with a wakeup channel,
+`server.close()` is the thread-safe shutdown signal. Kernels without that
+capability must call `await server.close_from_task(task)` from their currently
+running SmallOS task. After a manually started scheduler has already exited or
+failed, `server.finalize()` is the idempotent owner-thread cleanup operation on
+either kind of kernel.
 
 Execution adapters are likewise application-owned. Construct and close them
 around the runtime lifecycle rather than expecting managed `listen()` to
