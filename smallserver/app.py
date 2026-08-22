@@ -66,9 +66,10 @@ class SmallServer:
     ) -> ServerHandle:
         """Bind a TCP listener and schedule SmallOS listener/control tasks.
 
-        The caller owns ``runtime.start()``. ``ServerHandle.close()`` is safe
-        from a client or another thread and wakes the scheduler without
-        directly mutating SmallOS task state there.
+        The caller owns ``runtime.start()``. On kernels with a wakeup channel,
+        ``ServerHandle.close()`` is safe from another thread. Constrained
+        kernels use ``await ServerHandle.close_from_task(task)`` on the
+        scheduler thread instead.
         """
         from SmallPackage import SmallTask
 
@@ -141,7 +142,7 @@ class SmallServer:
             client = accepted.stream
             accepted_in_batch += 1
             if handle.closed or len(handle._connections) >= handle._config.max_connections:
-                handle._transport.close_safely(client)
+                handle._close_or_retain(client)
             else:
                 from SmallPackage import SmallTask
 
@@ -165,7 +166,7 @@ class SmallServer:
                                 cancel_task(connection_task)
                             except Exception:
                                 pass
-                    handle._transport.close_safely(client)
+                    handle._close_or_retain(client)
             if accepted_in_batch >= handle._config.accept_batch_size:
                 accepted_in_batch = 0
                 await task.yield_now()
@@ -212,8 +213,7 @@ class SmallServer:
                 await self._send_response(task, handle, client, response)
                 return
         finally:
-            handle._connections.pop(id(client), None)
-            handle._transport.close_safely(client)
+            handle._connection_finished(task, client)
 
     async def _send_response(
         self,

@@ -36,6 +36,7 @@ class FakeWakeupChannel:
         self.notify_calls = 0
         self.drain_calls = 0
         self.close_calls = 0
+        self.close_failures = 0
         self.notify_failures = 0
         self.drain_error: BaseException | None = None
 
@@ -52,6 +53,9 @@ class FakeWakeupChannel:
 
     def close(self) -> None:
         self.close_calls += 1
+        if self.close_failures:
+            self.close_failures -= 1
+            raise RuntimeError("wakeup close failed")
 
 
 class FakeKernel:

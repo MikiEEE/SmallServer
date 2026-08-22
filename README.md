@@ -65,9 +65,20 @@ server = app.serve(runtime, host="127.0.0.1", port=8000)
 runtime.start()
 ```
 
-Call `server.close()` from another thread or client-control path to request a
-scheduler-safe shutdown. Each current connection accepts one request and sends
-a `Connection: close` response.
+On a kernel with `supports_wakeup_channel() == True`, call `server.close()`
+from another thread or client-control path to request scheduler-safe shutdown.
+`Unix` provides this cross-thread wakeup capability.
+
+Constrained kernels may support TCP servers without supporting a thread-safe
+wakeup channel. On those kernels, `server.close()` raises instead of mutating
+runtime state from an unsafe context. A currently running SmallOS task can use
+`await server.close_from_task(task)` to close on the scheduler thread. The
+handle's `finished` property becomes true only after the listener, every
+connection, and the wakeup channel have closed successfully; `cleanup_errors`
+reports close failures that remain available for a later scheduler-side retry.
+
+Each current connection accepts one request and sends a `Connection: close`
+response.
 
 ## Define routes
 
