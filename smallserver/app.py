@@ -302,15 +302,20 @@ class SmallServer:
                 "the runtime; configure a caller-supplied SmallOS directly"
             )
         if managed:
-            priority_levels = (
-                ManagedRuntimeConfig().priority_levels
-                if runtime_config is None
-                else runtime_config.priority_levels
-            )
-            if max(resolved.listener_priority, resolved.connection_priority) >= priority_levels:
+            effective_runtime_config = runtime_config or ManagedRuntimeConfig()
+            if (
+                max(resolved.listener_priority, resolved.connection_priority)
+                >= effective_runtime_config.priority_levels
+            ):
                 raise ValueError(
                     "server task priorities must be lower than managed runtime "
                     "priority_levels"
+                )
+            required_tasks = resolved.max_connections + 2
+            if effective_runtime_config.task_capacity < required_tasks:
+                raise ValueError(
+                    "managed runtime task_capacity must be at least "
+                    "max_connections + 2 for listener and shutdown tasks"
                 )
         return resolved
 
