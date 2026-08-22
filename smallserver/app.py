@@ -10,17 +10,26 @@ from typing import Any
 
 from .errors import HTTPError
 from .http import Request, Response
-from .routing import RegexRouteConfig, Router
+from .routing import RegexRouteConfig, RouteMatchTimeout, RoutePathTooLarge, Router
 from .server import HTTPParseError, HTTPRequestParser, ServerConfig, ServerHandle
 
 Handler = Callable[[Request], Awaitable[Response]]
+RouteErrorObserver = Callable[[RouteMatchTimeout], None]
 
 
 class SmallServer:
     """Register static HTTP routes and dispatch requests to async handlers."""
 
-    def __init__(self, regex_config: RegexRouteConfig | None = None) -> None:
+    def __init__(
+        self,
+        regex_config: RegexRouteConfig | None = None,
+        *,
+        route_error_observer: RouteErrorObserver | None = None,
+    ) -> None:
+        if route_error_observer is not None and not callable(route_error_observer):
+            raise TypeError("route_error_observer must be callable or None")
         self._router = Router(regex_config)
+        self._route_error_observer = route_error_observer
 
     def route(self, path: str, methods: Iterable[str]) -> Callable[[Handler], Handler]:
         if not isinstance(path, str) or not path.startswith("/"):
@@ -132,7 +141,10 @@ class SmallServer:
 
     async def dispatch(self, request: Request) -> Response:
         """Run a registered handler or return a deterministic HTTP response."""
-        match = self._router.resolve(request.method, request.path)
+        try:
+            match = self._router.resolve(request.method, request.path)
+        except RoutePathTooLarge:
+            return Response.text("request target is too large", status=414)
         if match.handler is None:
             if match.allowed_methods:
                 return Response.text("method not allowed", status=405, headers={"Allow": ", ".join(match.allowed_methods)})
@@ -214,6 +226,9 @@ class SmallServer:
                     continue
                 try:
                     response = await self.dispatch(request)
+                except RouteMatchTimeout as exc:
+                    self._observe_route_error(exc)
+                    response = Response.text("internal server error", status=500)
                 except Exception:
                     response = Response.text("internal server error", status=500)
                 await self._send_response(task, client, response)
@@ -239,3 +254,12 @@ class SmallServer:
             if sent <= 0:
                 return
             offset += sent
+
+    def _observe_route_error(self, error: RouteMatchTimeout) -> None:
+        observer = self._route_error_observer
+        if observer is None:
+            return
+        try:
+            observer(error)
+        except Exception:
+            pass

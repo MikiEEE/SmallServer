@@ -59,6 +59,17 @@ class HTTPRequestParserTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "max_request_target_bytes"):
             ServerConfig(max_request_target_bytes=0)
 
+    def test_config_preserves_legacy_positional_field_mapping(self) -> None:
+        config = ServerConfig(1, 2, 3, 4, 5, 6, 7)
+        self.assertEqual(config.max_connections, 1)
+        self.assertEqual(config.max_header_bytes, 2)
+        self.assertEqual(config.max_header_count, 3)
+        self.assertEqual(config.max_body_bytes, 4)
+        self.assertEqual(config.receive_chunk_bytes, 5)
+        self.assertEqual(config.listener_priority, 6)
+        self.assertEqual(config.connection_priority, 7)
+        self.assertEqual(config.max_request_target_bytes, 8 * 1024)
+
     def test_serve_closes_bound_socket_when_runtime_fork_fails(self) -> None:
         class Listener:
             closed = False

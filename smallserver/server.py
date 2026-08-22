@@ -123,10 +123,10 @@ class ServerConfig:
     max_header_bytes: int = 16 * 1024
     max_header_count: int = 100
     max_body_bytes: int = 1024 * 1024
-    max_request_target_bytes: int = 8 * 1024
     receive_chunk_bytes: int = 8 * 1024
     listener_priority: int = 1
     connection_priority: int = 2
+    max_request_target_bytes: int = 8 * 1024
 
     def __post_init__(self) -> None:
         for name, value in self.__dict__.items():

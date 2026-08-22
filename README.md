@@ -136,12 +136,29 @@ async def article(request: Request) -> Response:
     return Response.json({"slug": request.path_params["slug"]})
 ```
 
-Patterns must begin with a literal `/` and do not need `^` or `$`. They are
-trusted application configuration, but paths are hostile input: SmallServer
+Patterns must begin with a literal `/` and do not need `^` or `$`. SmallServer
+wraps the complete expression in a slash guard, so every top-level alternative
+is constrained to an origin-form path. They are trusted application
+configuration, but paths are hostile input: SmallServer
 bounds pattern length, route count, named captures, path bytes, each match, and
 the total matching time. Prefer unambiguous repetition and narrow character
 classes even with these deadlines. A timeout raises `RouteMatchTimeout` with an
 opaque route ID and becomes a sanitized 500 response on the network path.
+
+Applications can observe that failure without receiving the hostile target:
+
+```python
+from smallserver import RouteMatchTimeout
+
+def observe_route_error(error: RouteMatchTimeout) -> None:
+    logger.error("route matching failed: %s", error.route_id)
+
+app = SmallServer(route_error_observer=observe_route_error)
+```
+
+The synchronous observer runs once on the connection task and should return
+quickly; observer failures are isolated from the response path. A path above
+the configured regex-routing byte limit returns 414 before matching begins.
 
 Requests retain the exact ASCII origin-form target in `request.raw_target`.
 Routing uses `request.path`, which excludes the query string;
@@ -149,6 +166,16 @@ Routing uses `request.path`, which excludes the query string;
 captures are percent-decoded, so `/files/a%2Fb` remains distinct from
 `/files/a/b`. `request.route_pattern` identifies the selected static path or
 regex pattern.
+
+Run `python benchmarks/route_benchmark.py` for a same-process comparison of
+the pre-router dictionary dispatch model and current router dispatch. Its JSON
+also records configured versus observed hostile-pattern timeout when the extra
+is installed; rates are machine-specific and should be compared on the same
+host.
+
+Release validation can run `python tests/installed_regex_smoke.py` from an
+environment where the built `smallserver[regex-routes]` wheel is installed.
+The project requires Python 3.10 or newer.
 
 ## Dispatch a request
 
