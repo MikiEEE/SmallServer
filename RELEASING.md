@@ -12,8 +12,10 @@ that commit, a generated changelog, and GitHub artifact provenance.
    already have a `v<version>` tag.
 4. Review user documentation and release-facing metadata in that pull request.
 5. Merge it into `main`.
-6. The `CI` workflow tests Python 3.10 and 3.12, compiles the source, builds the
-   wheel and source archive, and checks both distributions.
+6. The `CI` workflow installs the complete test extra, exercises the core,
+   regex-routing, WebSocket, and HTTP/2 suites on Python 3.10 and 3.12, compiles
+   the source, builds the wheel and source archive, and checks both
+   distributions.
 7. Only after that exact `main` commit succeeds, the `Release` workflow verifies
    it is still the tip of `main`, requires a new version, rebuilds and attests
    the distributions, creates the `v<version>` tag, and creates the GitHub
