@@ -54,13 +54,13 @@ Read-only properties: `address`, `port`, `closed`, `failure`, `finished`,
 `cleanup_errors`, `owned_connection_count`, `dropped_route_error_events`, and
 `route_observer_failures`.
 
+Operations: `close()`, `async close_from_task(task)`, and `finalize()`.
+
 ### `RegexRouteConfig(...)`
 
 Finite optional-regex limits. `RouteErrorEvent`, `RouteMatchTimeout`,
 `RoutePathTooLarge`, and `RegexRoutesUnavailable` describe its bounded error
 surface. Runtime regex matching requires `smallserver[regex-routes]`.
-
-Operations: `close()`, `async close_from_task(task)`, and `finalize()`.
 
 ## Adapters
 

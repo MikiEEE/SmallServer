@@ -13,11 +13,13 @@ The network server converts ordinary handler exceptions into a generic 500.
 `app.dispatch()` only catches `HTTPError`, so direct dispatch in tests preserves
 programming errors.
 
-A regex match timeout also becomes a generic 500. If configured,
-`route_error_observer` receives exactly one immutable, traceback-free
-`RouteErrorEvent` containing only an opaque route ID and category. Delivery is
-bounded and scheduler-local; dropped events and observer callback failures are
-reported by the corresponding `ServerHandle` counters.
+On HTTP/1.1 and HTTP/2 listeners, a regex match timeout becomes a generic 500.
+A direct `await app.dispatch(request)` instead raises `RouteMatchTimeout`. If a
+network listener has an observer configured, `route_error_observer` receives
+exactly one immutable, traceback-free `RouteErrorEvent` containing only an
+opaque route ID and category. Delivery is bounded and scheduler-local; dropped
+events and observer callback failures are reported by the corresponding
+`ServerHandle` counters.
 
 ## Configuration errors
 
