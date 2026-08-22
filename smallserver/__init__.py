@@ -2,7 +2,7 @@
 
 from .app import SmallServer
 from .adapters import AdapterRegistry, AdapterShutdownError, http_error_from_adapter
-from .errors import HTTPError
+from .errors import HTTPError, ServerStartupError
 from .http import Headers, Request, Response
 from .server import ServerConfig, ServerHandle
 
@@ -15,6 +15,7 @@ __all__ = [
     "Response",
     "ServerConfig",
     "ServerHandle",
+    "ServerStartupError",
     "SmallServer",
     "http_error_from_adapter",
 ]

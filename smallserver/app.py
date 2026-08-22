@@ -6,8 +6,12 @@ import inspect
 from collections.abc import Awaitable, Callable, Iterable
 from typing import Any
 
-from ._transport import KernelTransport, TransportHandle
-from .errors import HTTPError
+from ._transport import (
+    KernelTransport,
+    TransportHandle,
+    _TransportAcquisitionFailure,
+)
+from .errors import HTTPError, ServerStartupError, _CleanupTransaction
 from .http import Request, Response
 from .server import HTTPParseError, HTTPRequestParser, ServerConfig, ServerHandle
 
@@ -79,11 +83,35 @@ class SmallServer:
             raise ValueError("port must be an integer between 0 and 65535")
         config = config or ServerConfig()
         transport = KernelTransport(getattr(runtime, "kernel", None))
-        listener = transport.open_listener(host, port, config.max_connections)
+        try:
+            listener = transport.open_listener(host, port, config.max_connections)
+        except _TransportAcquisitionFailure as failure:
+            raise ServerStartupError(
+                failure.primary_error, failure.transaction
+            ) from failure.primary_error
         try:
             wakeup = transport.create_wakeup_channel()
-        except BaseException:
-            transport.close_safely(listener)
+        except _TransportAcquisitionFailure as failure:
+            try:
+                transport.close(listener)
+            except BaseException as cleanup_error:
+                failure.transaction.add(
+                    "listener", lambda: transport.close(listener), cleanup_error
+                )
+            raise ServerStartupError(
+                failure.primary_error, failure.transaction
+            ) from failure.primary_error
+        except BaseException as primary_error:
+            try:
+                transport.close(listener)
+            except BaseException as cleanup_error:
+                transaction = _CleanupTransaction()
+                transaction.add(
+                    "listener", lambda: transport.close(listener), cleanup_error
+                )
+                raise ServerStartupError(
+                    primary_error, transaction
+                ) from primary_error
             raise
         handle = ServerHandle(runtime, transport, listener, wakeup, config)
         tasks: tuple[Any, ...] = ()
@@ -105,8 +133,67 @@ class SmallServer:
                 )
                 tasks = (listener_task, close_task)
             runtime.fork(list(tasks))
-        except BaseException:
-            handle._abort_startup(tasks)
+        except BaseException as primary_error:
+            task_cleanup_failures = handle._abort_startup(tasks)
+            if task_cleanup_failures or not handle.finished:
+                transaction = _CleanupTransaction()
+                errors = {
+                    name: error for name, error in handle._cleanup_errors.items()
+                }
+                cancel_task = getattr(runtime, "cancel_task", None)
+                for index, (task, cleanup_error) in enumerate(
+                    task_cleanup_failures
+                ):
+
+                    def retry_task_cleanup(task: Any = task) -> None:
+                        if callable(cancel_task):
+                            cancel_task(task)
+                            return
+                        task_cancel = getattr(task, "cancel", None)
+                        if not callable(task_cancel):
+                            raise RuntimeError(
+                                "runtime cannot cancel a startup task"
+                            )
+                        task_cancel()
+
+                    transaction.add(
+                        "task:{}".format(index),
+                        retry_task_cleanup,
+                        cleanup_error,
+                    )
+                if wakeup is not None and not wakeup.closed:
+
+                    def retry_wakeup_cleanup() -> None:
+                        wakeup.close()
+                        handle._cleanup_errors.pop("wakeup", None)
+                        handle._update_finished()
+
+                    transaction.add(
+                        "wakeup",
+                        retry_wakeup_cleanup,
+                        errors.get("wakeup"),
+                    )
+                if not listener.closed:
+
+                    def retry_listener_cleanup() -> None:
+                        transport.close(listener)
+                        handle._cleanup_errors.pop("listener", None)
+                        handle._update_finished()
+
+                    transaction.add(
+                        "listener",
+                        retry_listener_cleanup,
+                        errors.get("listener"),
+                    )
+                if transaction.complete:
+                    transaction.add(
+                        "server",
+                        lambda: handle._finish_close(),
+                        RuntimeError("server startup cleanup is incomplete"),
+                    )
+                raise ServerStartupError(
+                    primary_error, transaction
+                ) from primary_error
             raise
         return handle
 
@@ -132,8 +219,18 @@ class SmallServer:
     async def _accept_loop(self, task: Any, handle: ServerHandle) -> None:
         accepted_in_batch = 0
         while not handle.closed:
+            if handle.owned_connection_count >= handle._config.max_connections:
+                await task.yield_now()
+                continue
             try:
                 accepted = await handle._transport.accept(task, handle._listener)
+            except _TransportAcquisitionFailure as failure:
+                assert failure.handle is not None
+                handle._accepted_setup_failed(
+                    failure.primary_error, failure.handle, task
+                )
+                failure.transaction.transfer()
+                raise failure.primary_error
             except Exception as exc:
                 if handle.closed:
                     return
@@ -141,8 +238,11 @@ class SmallServer:
                 raise
             client = accepted.stream
             accepted_in_batch += 1
-            if handle.closed or len(handle._connections) >= handle._config.max_connections:
-                handle._close_or_retain(client)
+            if handle.closed:
+                if not handle._close_or_retain(client, task):
+                    raise client.close_error or RuntimeError(
+                        "kernel connection close failed"
+                    )
             else:
                 from SmallPackage import SmallTask
 
@@ -157,7 +257,7 @@ class SmallServer:
                     handle._connections[id(client)] = (client, connection_task)
                     runtime = handle._runtime
                     runtime.fork(connection_task)
-                except Exception:
+                except BaseException as registration_error:
                     handle._connections.pop(id(client), None)
                     if connection_task is not None:
                         cancel_task = getattr(handle._runtime, "cancel_task", None)
@@ -166,7 +266,12 @@ class SmallServer:
                                 cancel_task(connection_task)
                             except Exception:
                                 pass
-                    handle._close_or_retain(client)
+                    if not handle._close_or_retain(
+                        client, task, registration_error
+                    ):
+                        raise registration_error
+                    if not isinstance(registration_error, Exception):
+                        raise
             if accepted_in_batch >= handle._config.accept_batch_size:
                 accepted_in_batch = 0
                 await task.yield_now()
@@ -187,6 +292,7 @@ class SmallServer:
             handle._config.max_header_count,
             handle._config.max_body_bytes,
         )
+        primary_error: BaseException | None = None
         try:
             while not handle.closed:
                 try:
@@ -212,8 +318,11 @@ class SmallServer:
                     response = Response.text("internal server error", status=500)
                 await self._send_response(task, handle, client, response)
                 return
+        except BaseException as exc:
+            primary_error = exc
+            raise
         finally:
-            handle._connection_finished(task, client)
+            handle._connection_finished(task, client, primary_error)
 
     async def _send_response(
         self,

@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch
 
-from smallserver import SmallServer
+from smallserver import ServerStartupError, SmallServer
 from smallserver.server import HTTPParseError, HTTPRequestParser, ServerConfig
 
 from tests.kernel_fakes import FakeKernel
@@ -54,7 +54,7 @@ class HTTPRequestParserTests(unittest.TestCase):
 
             def cancel_task(self, task) -> None:
                 self.cancelled += 1
-                task.coro.close()
+                task.cancel()
 
             def resume_task(self, task) -> None:
                 pass
@@ -96,4 +96,108 @@ class HTTPRequestParserTests(unittest.TestCase):
                 SmallServer().serve(runtime)
         self.assertEqual(len(runtime.cancelled), 1)
         self.assertEqual([handle.name for handle in runtime.kernel.closed], ["listener"])
+        self.assertEqual(runtime.kernel.wakeup.close_calls, 1)
+
+    def test_listener_setup_failure_retains_owner_until_retry_succeeds(self) -> None:
+        class Runtime:
+            def __init__(self) -> None:
+                self.kernel = FakeKernel()
+
+        runtime = Runtime()
+        primary = RuntimeError("listen setup failed")
+        runtime.kernel.operation_errors["listen"] = primary
+        runtime.kernel.close_failures[id(runtime.kernel.listener)] = 2
+
+        with self.assertRaises(ServerStartupError) as raised:
+            SmallServer().serve(runtime)
+
+        error = raised.exception
+        self.assertIs(error.primary_error, primary)
+        self.assertEqual(len(error.cleanup_errors), 1)
+        self.assertFalse(error.retry_cleanup())
+        self.assertTrue(error.retry_cleanup())
+        self.assertTrue(error.retry_cleanup())
+        self.assertTrue(error.cleanup_complete)
+        self.assertEqual(runtime.kernel.closed, [runtime.kernel.listener])
+
+    def test_wakeup_failure_retains_owner_until_retry_succeeds(self) -> None:
+        class Runtime:
+            def __init__(self) -> None:
+                self.kernel = FakeKernel()
+
+        runtime = Runtime()
+        runtime.kernel.invalid_wait_objects.add(id(runtime.kernel.wakeup.wait_object))
+        runtime.kernel.wakeup.close_failures = 2
+
+        with self.assertRaises(ServerStartupError) as raised:
+            SmallServer().serve(runtime)
+
+        error = raised.exception
+        self.assertIsInstance(error.primary_error, ValueError)
+        self.assertEqual(runtime.kernel.closed, [runtime.kernel.listener])
+        self.assertFalse(error.finalize())
+        self.assertTrue(error.finalize())
+        self.assertEqual(runtime.kernel.wakeup.close_calls, 3)
+
+    def test_task_registration_failure_retains_all_server_resources(self) -> None:
+        class Runtime:
+            def __init__(self) -> None:
+                self.kernel = FakeKernel()
+                self.cancelled = []
+
+            def fork(self, tasks) -> None:
+                raise RuntimeError("no task capacity")
+
+            def cancel_task(self, task) -> None:
+                self.cancelled.append(task)
+                task.cancel()
+
+            def resume_task(self, task) -> None:
+                pass
+
+        runtime = Runtime()
+        runtime.kernel.close_failures[id(runtime.kernel.listener)] = 2
+        runtime.kernel.wakeup.close_failures = 2
+
+        with self.assertRaises(ServerStartupError) as raised:
+            SmallServer().serve(runtime)
+
+        error = raised.exception
+        self.assertEqual(str(error.primary_error), "no task capacity")
+        self.assertEqual(len(error.cleanup_errors), 2)
+        self.assertFalse(error.retry_cleanup())
+        self.assertTrue(error.retry_cleanup())
+        self.assertEqual(runtime.kernel.closed, [runtime.kernel.listener])
+        self.assertEqual(runtime.kernel.wakeup.close_calls, 3)
+
+    def test_task_cancellation_failure_is_owned_until_retry(self) -> None:
+        class Runtime:
+            def __init__(self) -> None:
+                self.kernel = FakeKernel()
+                self.cancel_attempts: dict[int, int] = {}
+
+            def fork(self, tasks) -> None:
+                raise RuntimeError("registration failed")
+
+            def cancel_task(self, task) -> None:
+                attempts = self.cancel_attempts.get(id(task), 0) + 1
+                self.cancel_attempts[id(task)] = attempts
+                if attempts <= 2:
+                    raise RuntimeError("cancel failed")
+                task.cancel()
+
+            def resume_task(self, task) -> None:
+                pass
+
+        runtime = Runtime()
+        with self.assertRaises(ServerStartupError) as raised:
+            SmallServer().serve(runtime)
+
+        error = raised.exception
+        self.assertEqual(str(error.primary_error), "registration failed")
+        self.assertEqual(len(error.cleanup_errors), 2)
+        self.assertFalse(error.retry_cleanup())
+        self.assertTrue(error.retry_cleanup())
+        self.assertTrue(error.cleanup_complete)
+        self.assertEqual(runtime.kernel.closed, [runtime.kernel.listener])
         self.assertEqual(runtime.kernel.wakeup.close_calls, 1)

@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from .errors import _CleanupTransaction
+
 
 class WakeupChannelLike(Protocol):
     """Opaque scheduler wakeup channel supplied by the active kernel."""
@@ -74,6 +76,21 @@ class AcceptedConnection:
     peer_address: object | None
 
 
+class _TransportAcquisitionFailure(Exception):
+    """Internal ownership transfer when acquisition rollback cannot finish."""
+
+    def __init__(
+        self,
+        primary_error: BaseException,
+        transaction: _CleanupTransaction,
+        handle: TransportHandle | None = None,
+    ) -> None:
+        self.primary_error = primary_error
+        self.transaction = transaction
+        self.handle = handle
+        super().__init__("kernel resource acquisition cleanup is incomplete")
+
+
 @dataclass(eq=False)
 class WakeupChannel:
     """Validated wake channel with a cached readiness object."""
@@ -132,6 +149,8 @@ class KernelTransport:
         missing = [name for name in self._REQUIRED_METHODS if not callable(getattr(kernel, name, None))]
         if wakeup_supported and not callable(getattr(kernel, "create_wakeup_channel", None)):
             missing.append("create_wakeup_channel")
+        if wakeup_supported and not callable(getattr(kernel, "validate_io_wait_object", None)):
+            missing.append("validate_io_wait_object")
         if missing:
             raise TypeError(
                 "the active kernel is missing TCP server operations: {}".format(
@@ -155,11 +174,19 @@ class KernelTransport:
             self._kernel.socket_bind(listener.raw, address_info)
             self._kernel.socket_listen(listener.raw, backlog)
             self._kernel.socket_setblocking(listener.raw, False)
-        except BaseException:
+        except BaseException as primary_error:
             try:
                 self.close(listener)
-            except BaseException:
-                pass
+            except BaseException as cleanup_error:
+                transaction = _CleanupTransaction()
+                transaction.add(
+                    "listener",
+                    lambda: self.close(listener),
+                    cleanup_error,
+                )
+                raise _TransportAcquisitionFailure(
+                    primary_error, transaction, listener
+                ) from primary_error
             raise
         return listener
 
@@ -174,11 +201,19 @@ class KernelTransport:
         try:
             self._kernel.socket_setblocking(stream.raw, False)
             peer = self._kernel.socket_peer_address(stream.raw)
-        except BaseException:
+        except BaseException as primary_error:
             try:
                 self.close(stream)
-            except BaseException:
-                pass
+            except BaseException as cleanup_error:
+                transaction = _CleanupTransaction()
+                transaction.add(
+                    "accepted-connection",
+                    lambda: self.close(stream),
+                    cleanup_error,
+                )
+                raise _TransportAcquisitionFailure(
+                    primary_error, transaction, stream
+                ) from primary_error
             raise
         return AcceptedConnection(stream, peer if peer is not None else address)
 
@@ -267,19 +302,30 @@ class KernelTransport:
             if missing:
                 raise TypeError("the active kernel returned an invalid wakeup channel")
             wait_object = raw_channel.wait_object
-            validator = getattr(self._kernel, "validate_io_wait_object", None)
-            if callable(validator):
-                valid, validation_error = validator(wait_object)
-                if not valid:
-                    if validation_error is not None:
-                        raise validation_error
-                    raise ValueError("the active kernel returned an invalid wakeup wait object")
+            validator = self._kernel.validate_io_wait_object
+            valid, validation_error = validator(wait_object)
+            if not valid:
+                if validation_error is not None:
+                    raise validation_error
+                raise ValueError("the active kernel returned an invalid wakeup wait object")
             return WakeupChannel(raw_channel, wait_object)
-        except BaseException:
+        except BaseException as primary_error:
             try:
                 close = getattr(raw_channel, "close", None)
-                if callable(close):
+                if not callable(close):
+                    raise TypeError("the wakeup channel cannot be closed")
+                close()
+            except BaseException as cleanup_error:
+                transaction = _CleanupTransaction()
+
+                def close_raw_channel() -> None:
+                    close = getattr(raw_channel, "close", None)
+                    if not callable(close):
+                        raise RuntimeError("wakeup channel cleanup remains unavailable")
                     close()
-            except BaseException:
-                pass
+
+                transaction.add("wakeup", close_raw_channel, cleanup_error)
+                raise _TransportAcquisitionFailure(
+                    primary_error, transaction
+                ) from primary_error
             raise

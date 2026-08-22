@@ -63,6 +63,26 @@ class KernelTransportTests(unittest.TestCase):
             [("supports_tcp_server",), ("supports_wakeup_channel",)],
         )
 
+    def test_wakeup_validator_is_mandatory_before_address_resolution(self) -> None:
+        for validator in (None, 42):
+            with self.subTest(validator=validator):
+                kernel = FakeKernel()
+                kernel.validate_io_wait_object = validator  # type: ignore[assignment]
+                with self.assertRaisesRegex(TypeError, "validate_io_wait_object"):
+                    KernelTransport(kernel)
+                self.assertEqual(
+                    kernel.calls,
+                    [("supports_tcp_server",), ("supports_wakeup_channel",)],
+                )
+
+    def test_wakeup_validator_rejects_invalid_object(self) -> None:
+        kernel = FakeKernel()
+        kernel.invalid_wait_objects.add(id(kernel.wakeup.wait_object))
+        transport = KernelTransport(kernel)
+        with self.assertRaisesRegex(ValueError, "invalid wait object"):
+            transport.create_wakeup_channel()
+        self.assertEqual(kernel.wakeup.close_calls, 1)
+
     def test_listener_uses_one_opaque_address_record_and_rolls_back_failure(self) -> None:
         kernel = FakeKernel()
         kernel.fail_operation = "listen"
@@ -82,11 +102,11 @@ class KernelTransportTests(unittest.TestCase):
         kernel = FakeKernel()
         primary = FatalSetup("setup interrupted")
         kernel.operation_errors["listen"] = primary
-        kernel.close_failures[id(kernel.listener)] = 1
         transport = KernelTransport(kernel)
         with self.assertRaises(FatalSetup) as raised:
             transport.open_listener("127.0.0.1", 0, 1)
         self.assertIs(raised.exception, primary)
+        self.assertEqual(kernel.closed, [kernel.listener])
 
     def test_accept_and_stream_operations_honor_both_retry_directions(self) -> None:
         kernel = FakeKernel()
@@ -209,19 +229,92 @@ class KernelTransportTests(unittest.TestCase):
         occupied = TransportHandle(OpaqueHandle("occupied"))
         handle._connections[id(occupied)] = (occupied, object())
         clients = [OpaqueHandle("overflow-{}".format(index)) for index in range(4)]
-        kernel.accept_results = [
-            *((client, None) for client in clients),
-            RuntimeError("listener failed"),
-        ]
-        task = FakeTask()
+        kernel.accept_results = [*((client, None) for client in clients)]
 
-        with self.assertRaisesRegex(RuntimeError, "listener failed"):
+        class CapacityTask(FakeTask):
+            async def yield_now(self) -> None:
+                await super().yield_now()
+                if self.yields == 3:
+                    raise RuntimeError("stop capacity probe")
+
+        task = CapacityTask()
+
+        with self.assertRaisesRegex(RuntimeError, "stop capacity probe"):
             run_immediate(SmallServer()._accept_loop(task, handle))
 
-        self.assertEqual(task.yields, 2)
-        self.assertEqual(kernel.closed, clients)
+        self.assertEqual(task.yields, 3)
+        self.assertFalse(any(call[0] == "socket_accept" for call in kernel.calls))
+        self.assertEqual(handle.owned_connection_count, 1)
+        self.assertEqual(kernel.closed, [])
         run_immediate(SmallServer()._close_watcher(FakeTask(), handle))
-        self.assertEqual(kernel.closed, clients + [occupied.raw, listener.raw])
+        self.assertEqual(kernel.closed, [occupied.raw, listener.raw])
+
+    def test_persistent_rejected_close_failure_is_fatal_and_bounded(self) -> None:
+        class Runtime:
+            def fork(self, task) -> None:
+                raise RuntimeError("task capacity")
+
+            def cancel_task(self, task) -> None:
+                task.cancel()
+
+            def resume_task(self, task) -> None:
+                pass
+
+        kernel = FakeKernel()
+        transport = KernelTransport(kernel)
+        listener = transport.open_listener("127.0.0.1", 0, 2)
+        handle = ServerHandle(
+            Runtime(),
+            transport,
+            listener,
+            transport.create_wakeup_channel(),
+            ServerConfig(max_connections=2, accept_batch_size=1),
+        )
+        clients = [OpaqueHandle("attacker-{}".format(index)) for index in range(20)]
+        kernel.accept_results = [*((client, None) for client in clients)]
+        kernel.close_failures[id(clients[0])] = 100
+        task = FakeTask()
+
+        with self.assertRaisesRegex(RuntimeError, "task capacity"):
+            run_immediate(SmallServer()._accept_loop(task, handle))
+
+        accepts = [call for call in kernel.calls if call[0] == "socket_accept"]
+        self.assertEqual(len(accepts), 1)
+        self.assertTrue(handle.closed)
+        self.assertEqual(str(handle.failure), "task capacity")
+        self.assertEqual(str(handle.cleanup_errors[0]), "close failed")
+        self.assertEqual(handle.owned_connection_count, 1)
+        self.assertLessEqual(
+            handle.owned_connection_count, handle._config.max_connections
+        )
+
+    def test_accepted_configuration_close_failure_transfers_to_server(self) -> None:
+        class Runtime:
+            def resume_task(self, task) -> None:
+                pass
+
+        kernel = FakeKernel()
+        transport = KernelTransport(kernel)
+        listener = transport.open_listener("127.0.0.1", 0, 1)
+        handle = ServerHandle(
+            Runtime(), transport, listener, transport.create_wakeup_channel(), ServerConfig()
+        )
+        client = OpaqueHandle("unconfigured")
+        kernel.accept_results = [(client, None)]
+        kernel.operation_errors["setblocking"] = RuntimeError("configure failed")
+        kernel.close_failures[id(client)] = 2
+
+        with self.assertRaisesRegex(RuntimeError, "configure failed"):
+            run_immediate(SmallServer()._accept_loop(FakeTask(), handle))
+
+        self.assertTrue(handle.closed)
+        self.assertEqual(handle.owned_connection_count, 1)
+        self.assertEqual(str(handle.failure), "configure failed")
+        run_immediate(SmallServer()._close_watcher(FakeTask(), handle))
+        self.assertFalse(handle.finished)
+        handle._finish_close()
+        self.assertTrue(handle.finished)
+        self.assertCountEqual(kernel.closed, [client, listener.raw])
 
     def test_server_handle_signals_and_releases_each_resource_once(self) -> None:
         class Runtime:
@@ -305,6 +398,8 @@ class KernelTransportTests(unittest.TestCase):
         self.assertFalse(owned_client.closed)
         self.assertIn(id(owned_client), handle._closing_connections)
         self.assertEqual(len(handle.cleanup_errors), 1)
+        self.assertTrue(handle.closed)
+        self.assertIs(handle.failure, owned_client.close_error)
         handle.close()
         run_immediate(SmallServer()._close_watcher(FakeTask(), handle))
         self.assertTrue(owned_client.closed)
@@ -337,6 +432,7 @@ class KernelTransportTests(unittest.TestCase):
         self.assertIs(raised.exception, primary)
         self.assertIn(id(owned_client), handle._closing_connections)
         self.assertIs(handle.cleanup_errors[0], owned_client.close_error)
+        self.assertIs(handle.failure, primary)
 
     def test_finalization_retries_listener_and_wakeup_close_failures(self) -> None:
         class Runtime:

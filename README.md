@@ -77,6 +77,19 @@ handle's `finished` property becomes true only after the listener, every
 connection, and the wakeup channel have closed successfully; `cleanup_errors`
 reports close failures that remain available for a later scheduler-side retry.
 
+If startup fails and the kernel also fails to release an acquired listener or
+wakeup resource, `serve()` raises `ServerStartupError`. Its `primary_error`
+preserves the startup failure and `cleanup_errors` reports the outstanding
+cleanup attempts without exposing kernel handles. Keep the exception and call
+`retry_cleanup()` (or `finalize()`) until it returns `True`; later calls remain
+safe and return `True`.
+
+`max_connections` bounds every connection stream still owned by the server,
+including streams retained after a failed close. At capacity the listener
+cooperatively yields without accepting another connection. Any connection
+close failure is fatal and stops further acceptance while retaining the stream
+for an explicit shutdown-cleanup retry.
+
 Each current connection accepts one request and sends a `Connection: close`
 response.
 

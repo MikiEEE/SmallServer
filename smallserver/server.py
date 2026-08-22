@@ -170,6 +170,11 @@ class ServerHandle:
         """Latest close failures for resources still owned by this server."""
         return tuple(self._cleanup_errors.values())
 
+    @property
+    def owned_connection_count(self) -> int:
+        """Connections still owned, including streams awaiting close retry."""
+        return len(self._connections) + len(self._closing_connections)
+
     def close(self) -> None:
         """Request external shutdown through a kernel wakeup channel."""
         if self._finished:
@@ -204,7 +209,8 @@ class ServerHandle:
 
     def _listener_failed(self, exc: BaseException, task: Any) -> None:
         """Record a fatal accept failure and make shutdown observable."""
-        self._failure = exc
+        if self._failure is None:
+            self._failure = exc
         self._close_requested = True
         if self._wakeup is not None:
             try:
@@ -248,7 +254,7 @@ class ServerHandle:
                 except BaseException:
                     pass
                 self._connections.pop(identity, None)
-                self._close_or_retain(connection)
+                self._close_or_retain(connection, current_task)
         if (
             self._listener_task is not None
             and self._listener_task is not current_task
@@ -268,20 +274,67 @@ class ServerHandle:
                 self._cleanup_errors.pop("listener", None)
         self._update_finished()
 
-    def _close_or_retain(self, connection: TransportHandle) -> None:
+    def _close_or_retain(
+        self,
+        connection: TransportHandle,
+        task: Any = None,
+        primary_error: BaseException | None = None,
+    ) -> bool:
+        """Close a connection or retain it and make the close failure fatal."""
         identity = id(connection)
         if self._transport.close_safely(connection):
             self._closing_connections.pop(identity, None)
             self._cleanup_errors.pop("connection:{}".format(identity), None)
-            return
+            return True
         self._closing_connections[identity] = connection
         error = connection.close_error or RuntimeError("kernel connection close failed")
         self._cleanup_errors["connection:{}".format(identity)] = error
+        self._connection_close_failed(error, task, primary_error)
+        return False
 
-    def _connection_finished(self, task: Any, connection: TransportHandle) -> None:
+    def _connection_close_failed(
+        self,
+        error: BaseException,
+        task: Any = None,
+        primary_error: BaseException | None = None,
+    ) -> None:
+        if self._failure is None:
+            self._failure = primary_error or error
+        self._close_requested = True
+        if self._finalization_attempted:
+            return
+        if self._wakeup is not None and not self._notification_sent:
+            try:
+                self._wakeup.notify()
+            except BaseException:
+                self._finish_close(current_task=task)
+                return
+            self._notification_sent = True
+            return
+        if self._wakeup is None:
+            self._finish_close(current_task=task)
+
+    def _accepted_setup_failed(
+        self, primary_error: BaseException, connection: TransportHandle, task: Any
+    ) -> None:
+        """Take ownership of an accepted stream whose configuration rollback failed."""
+        identity = id(connection)
+        self._closing_connections[identity] = connection
+        error = connection.close_error or RuntimeError("kernel connection close failed")
+        self._cleanup_errors["connection:{}".format(identity)] = error
+        if self._failure is None:
+            self._failure = primary_error
+        self._connection_close_failed(error, task, primary_error)
+
+    def _connection_finished(
+        self,
+        task: Any,
+        connection: TransportHandle,
+        primary_error: BaseException | None = None,
+    ) -> None:
         """Release a completed connection without losing failed-close ownership."""
         self._connections.pop(id(connection), None)
-        self._close_or_retain(connection)
+        self._close_or_retain(connection, task, primary_error)
         self._update_finished()
 
     def _update_finished(self) -> None:
@@ -296,14 +349,25 @@ class ServerHandle:
         if self._finished:
             self._cleanup_errors.clear()
 
-    def _abort_startup(self, tasks: tuple[Any, ...]) -> None:
+    def _abort_startup(
+        self, tasks: tuple[Any, ...]
+    ) -> tuple[tuple[Any, BaseException], ...]:
         """Release bound resources after task registration fails."""
         self._close_requested = True
+        failures: list[tuple[Any, BaseException]] = []
         cancel_task = getattr(self._runtime, "cancel_task", None)
-        if callable(cancel_task):
-            for task in reversed(tasks):
-                try:
+        for task in reversed(tasks):
+            try:
+                if callable(cancel_task):
                     cancel_task(task)
-                except BaseException:
-                    pass
+                else:
+                    task_cancel = getattr(task, "cancel", None)
+                    if not callable(task_cancel):
+                        raise RuntimeError(
+                            "runtime cannot cancel a startup task"
+                        )
+                    task_cancel()
+            except BaseException as exc:
+                failures.append((task, exc))
         self._finish_close()
+        return tuple(failures)
