@@ -4,7 +4,7 @@ import unittest
 import warnings
 from unittest.mock import patch
 
-from smallserver import ServerStartupError, SmallServer
+from smallserver import ManagedRuntimeConfig, ServerStartupError, SmallServer
 from smallserver.errors import _CleanupTransaction
 from smallserver.server import HTTPParseError, HTTPRequestParser, ServerConfig
 
@@ -46,6 +46,43 @@ class HTTPRequestParserTests(unittest.TestCase):
             ServerConfig(max_connections=0)
         with self.assertRaisesRegex(ValueError, "max_connections"):
             ServerConfig(max_connections=True)
+        with self.assertRaisesRegex(TypeError, "managed_runtime"):
+            ServerConfig(managed_runtime={})  # type: ignore[arg-type]
+
+    def test_managed_runtime_config_is_validated_and_defensively_copied(self) -> None:
+        source = {"http": {"max_response_size": 4096}}
+        config = ManagedRuntimeConfig(
+            task_capacity=128,
+            priority_levels=4,
+            io_buffer_length=0,
+            eternal_watchers=True,
+            client_defaults=source,
+        )
+        source["http"]["max_response_size"] = 1
+
+        self.assertEqual(
+            config.to_smallos_config(),
+            {
+                "task_capacity": 128,
+                "priority_levels": 4,
+                "io_buffer_length": 0,
+                "eternal_watchers": True,
+                "client_defaults": {"http": {"max_response_size": 4096}},
+            },
+        )
+        with self.assertRaises(TypeError):
+            config.client_defaults["http"]["max_response_size"] = 1  # type: ignore[index]
+
+        invalid_values = (
+            {"task_capacity": True},
+            {"priority_levels": 1},
+            {"io_buffer_length": -1},
+            {"eternal_watchers": 1},
+            {"client_defaults": {"http": {"max_response_size": -1}}},
+        )
+        for values in invalid_values:
+            with self.subTest(values=values), self.assertRaises((TypeError, ValueError)):
+                ManagedRuntimeConfig(**values)  # type: ignore[arg-type]
 
     def test_serve_closes_kernel_resources_when_runtime_fork_fails(self) -> None:
         class Runtime:
