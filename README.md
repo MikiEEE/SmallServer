@@ -71,6 +71,13 @@ whose cached `address` and `port` remain available for diagnostics. Each
 current connection accepts one request and sends a `Connection: close`
 response.
 
+If the runtime exits normally but cleanup is incomplete, `listen()` returns an
+unfinished handle so the caller can inspect `cleanup_errors` and retry
+`finalize()`. If runtime startup raises while cleanup is incomplete, ordinary
+failures are wrapped by `ServerStartupError`; `KeyboardInterrupt` and
+`SystemExit` keep their identity and expose that cleanup owner as `__cause__`.
+Until cleanup succeeds, the application rejects another listener invocation.
+
 ## Advanced runtime control
 
 Supply a configured runtime when the application needs to coordinate other
