@@ -10,6 +10,13 @@ from .errors import (
     ServerStartupError,
 )
 from .http import Headers, Request, Response
+from .routing import (
+    RegexRouteConfig,
+    RegexRoutesUnavailable,
+    RouteErrorEvent,
+    RouteMatchTimeout,
+    RoutePathTooLarge,
+)
 from .server import ServerConfig, ServerHandle
 
 if TYPE_CHECKING:
@@ -31,8 +38,13 @@ __all__ = [
     "AdapterShutdownError",
     "Headers",
     "HTTPError",
+    "RegexRouteConfig",
+    "RegexRoutesUnavailable",
     "Request",
     "Response",
+    "RouteErrorEvent",
+    "RouteMatchTimeout",
+    "RoutePathTooLarge",
     "ServerConfig",
     "ServerConfigurationError",
     "ServerFinalizationError",
