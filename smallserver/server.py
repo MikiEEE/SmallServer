@@ -134,10 +134,14 @@ class ServerHandle:
         self._config = config
         self._close_requested = False
         self._notification_sent = False
+        self._finalization_attempted = False
         self._finished = False
         self._failure: BaseException | None = None
+        self._cleanup_errors: dict[str, BaseException] = {}
         self._listener_task: Any = None
+        self._listener_resumed = False
         self._connections: dict[int, tuple[TransportHandle, Any]] = {}
+        self._closing_connections: dict[int, TransportHandle] = {}
 
     @property
     def address(self) -> tuple[str, int]:
@@ -156,6 +160,16 @@ class ServerHandle:
         """Return the fatal listener failure that initiated shutdown, if any."""
         return self._failure
 
+    @property
+    def finished(self) -> bool:
+        """Whether every kernel-owned server resource closed successfully."""
+        return self._finished
+
+    @property
+    def cleanup_errors(self) -> tuple[BaseException, ...]:
+        """Latest close failures for resources still owned by this server."""
+        return tuple(self._cleanup_errors.values())
+
     def close(self) -> None:
         """Request external shutdown through a kernel wakeup channel."""
         if self._finished:
@@ -167,6 +181,11 @@ class ServerHandle:
             )
         self._close_requested = True
         if self._notification_sent:
+            if self._finalization_attempted and not self._finished:
+                raise RuntimeError(
+                    "shutdown cleanup is incomplete; retry it from the scheduler "
+                    "with await server.close_from_task(task)"
+                )
             return
         # A nonconforming channel may raise. Keep the server unfinished so the
         # caller can retry notification instead of turning close() into a no-op.
@@ -174,12 +193,13 @@ class ServerHandle:
         self._notification_sent = True
 
     async def close_from_task(self, task: Any) -> None:
-        """Close on the scheduler thread when no external wake channel exists."""
+        """Close or retry incomplete cleanup on the SmallOS scheduler thread."""
         if getattr(self._runtime, "cursor", None) is not task:
             raise RuntimeError("close_from_task() requires the currently running SmallOS task")
         if self._finished:
             return
         self._close_requested = True
+        self._finalization_attempted = True
         self._finish_close(current_task=task)
 
     def _listener_failed(self, exc: BaseException, task: Any) -> None:
@@ -199,26 +219,82 @@ class ServerHandle:
         if self._finished:
             return
         self._close_requested = True
-        self._finished = True
-        if self._wakeup is not None:
+        self._finalization_attempted = True
+        if self._wakeup is not None and not self._wakeup.closed:
             try:
                 self._wakeup.close()
-            except BaseException:
-                pass
-        for connection, task in list(self._connections.values()):
+            except BaseException as exc:
+                self._cleanup_errors["wakeup"] = exc
+            else:
+                self._cleanup_errors.pop("wakeup", None)
+
+        # Retry resources retained by an earlier close failure once per
+        # finalization attempt. Newly failed active connections remain owned
+        # for the next attempt rather than being retried in a tight loop.
+        for identity, connection in list(self._closing_connections.items()):
+            if self._transport.close_safely(connection):
+                self._closing_connections.pop(identity, None)
+                self._cleanup_errors.pop("connection:{}".format(identity), None)
+            else:
+                error = connection.close_error or RuntimeError(
+                    "kernel connection close failed"
+                )
+                self._cleanup_errors["connection:{}".format(identity)] = error
+
+        for identity, (connection, task) in list(self._connections.items()):
             if task is not current_task:
                 try:
                     self._runtime.resume_task(task)
                 except BaseException:
                     pass
-                self._transport.close_safely(connection)
-        self._connections.clear()
-        if self._listener_task is not None and self._listener_task is not current_task:
+                self._connections.pop(identity, None)
+                self._close_or_retain(connection)
+        if (
+            self._listener_task is not None
+            and self._listener_task is not current_task
+            and not self._listener_resumed
+        ):
             try:
                 self._runtime.resume_task(self._listener_task)
             except BaseException:
                 pass
-        self._transport.close_safely(self._listener)
+            self._listener_resumed = True
+        if not self._listener.closed:
+            try:
+                self._transport.close(self._listener)
+            except BaseException as exc:
+                self._cleanup_errors["listener"] = exc
+            else:
+                self._cleanup_errors.pop("listener", None)
+        self._update_finished()
+
+    def _close_or_retain(self, connection: TransportHandle) -> None:
+        identity = id(connection)
+        if self._transport.close_safely(connection):
+            self._closing_connections.pop(identity, None)
+            self._cleanup_errors.pop("connection:{}".format(identity), None)
+            return
+        self._closing_connections[identity] = connection
+        error = connection.close_error or RuntimeError("kernel connection close failed")
+        self._cleanup_errors["connection:{}".format(identity)] = error
+
+    def _connection_finished(self, task: Any, connection: TransportHandle) -> None:
+        """Release a completed connection without losing failed-close ownership."""
+        self._connections.pop(id(connection), None)
+        self._close_or_retain(connection)
+        self._update_finished()
+
+    def _update_finished(self) -> None:
+        wakeup_closed = self._wakeup is None or self._wakeup.closed
+        self._finished = bool(
+            self._close_requested
+            and wakeup_closed
+            and self._listener.closed
+            and not self._connections
+            and not self._closing_connections
+        )
+        if self._finished:
+            self._cleanup_errors.clear()
 
     def _abort_startup(self, tasks: tuple[Any, ...]) -> None:
         """Release bound resources after task registration fails."""

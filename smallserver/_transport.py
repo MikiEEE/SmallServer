@@ -63,6 +63,7 @@ class TransportHandle:
 
     raw: object
     closed: bool = False
+    close_error: BaseException | None = None
 
 
 @dataclass(frozen=True)
@@ -80,6 +81,7 @@ class WakeupChannel:
     raw: WakeupChannelLike
     wait_object: object
     closed: bool = False
+    close_error: BaseException | None = None
 
     def notify(self) -> None:
         self.raw.notify()
@@ -90,8 +92,13 @@ class WakeupChannel:
     def close(self) -> None:
         if self.closed:
             return
-        self.raw.close()
+        try:
+            self.raw.close()
+        except BaseException as exc:
+            self.close_error = exc
+            raise
         self.closed = True
+        self.close_error = None
 
 
 class KernelTransport:
@@ -231,14 +238,21 @@ class KernelTransport:
     def close(self, handle: TransportHandle) -> None:
         if handle.closed:
             return
-        self._kernel.socket_close(handle.raw)
+        try:
+            self._kernel.socket_close(handle.raw)
+        except BaseException as exc:
+            handle.close_error = exc
+            raise
         handle.closed = True
+        handle.close_error = None
 
-    def close_safely(self, handle: TransportHandle) -> None:
+    def close_safely(self, handle: TransportHandle) -> bool:
+        """Attempt terminal close and report whether the handle is now closed."""
         try:
             self.close(handle)
         except BaseException:
-            pass
+            return False
+        return True
 
     def create_wakeup_channel(self) -> WakeupChannel | None:
         if not self.supports_wakeup_channel:
