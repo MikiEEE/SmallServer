@@ -1,8 +1,10 @@
 import importlib.util
 from dataclasses import FrozenInstanceError
+import inspect
 import socket
 import threading
 import unittest
+from unittest.mock import patch
 
 from SmallPackage import SmallOS, Unix
 from SmallPackage.adapters.threads import ThreadAdapter
@@ -13,6 +15,7 @@ from smallserver import (
     Request,
     Response,
     RouteErrorEvent,
+    RouteMatchTimeout,
     SmallServer,
 )
 
@@ -181,9 +184,29 @@ class SmallOSServerIntegrationTests(unittest.TestCase):
     def test_regex_timeout_is_observed_once_and_does_not_stop_server(self) -> None:
         runtime = SmallOS().setKernel(Unix())
         observed: list[RouteErrorEvent] = []
+        observer_graph = []
+        observer_finished = threading.Event()
+        hook_finished = threading.Event()
+        hook_events = []
+
+        def observe(event: RouteErrorEvent) -> None:
+            observed.append(event)
+            caller_locals = []
+            frame = inspect.currentframe()
+            while frame is not None:
+                caller_locals.append(dict(frame.f_locals))
+                frame = frame.f_back
+            observer_graph.extend(_reachable_objects(caller_locals))
+            observer_finished.set()
+            raise RuntimeError("intentional observer failure")
+
+        def observe_thread_failure(arguments) -> None:
+            hook_events.append(arguments)
+            hook_finished.set()
+
         app = SmallServer(
             RegexRouteConfig(match_timeout=0.001, total_match_timeout=0.005),
-            route_error_observer=observed.append,
+            route_error_observer=observe,
         )
 
         pattern_secret = "sensitive-pattern-marker"
@@ -217,15 +240,20 @@ class SmallOSServerIntegrationTests(unittest.TestCase):
                 ).format(hostile_path, authorization_secret, len(body_secret)).encode("ascii")
                 received.append(self._exchange(server.port, request + body_secret))
                 received.append(self._request(server.port, "/health"))
+                if not observer_finished.wait(2):
+                    raise TimeoutError("route observer did not run")
+                if not hook_finished.wait(2):
+                    raise TimeoutError("observer failure was not reported")
             except BaseException as exc:
                 errors.append(exc)
             finally:
                 server.close()
 
         worker = threading.Thread(target=client, daemon=True)
-        worker.start()
-        runtime.start()
-        worker.join(timeout=3)
+        with patch("threading.excepthook", side_effect=observe_thread_failure):
+            worker.start()
+            runtime.start()
+            worker.join(timeout=3)
         self.assertFalse(worker.is_alive())
         self.assertEqual(errors, [])
         self.assertEqual(len(observed), 1)
@@ -247,6 +275,17 @@ class SmallOSServerIntegrationTests(unittest.TestCase):
         self.assertFalse(any(isinstance(value, Request) for value in reachable))
         for secret in (hostile_path, authorization_secret, body_secret.decode("ascii"), pattern_secret):
             self.assertNotIn(secret, reachable_strings)
+
+        caller_strings = {value for value in observer_graph if isinstance(value, str)}
+        self.assertFalse(any(isinstance(value, Request) for value in observer_graph))
+        self.assertFalse(any(isinstance(value, RouteMatchTimeout) for value in observer_graph))
+        for secret in (hostile_path, authorization_secret, body_secret.decode("ascii"), pattern_secret):
+            self.assertNotIn(secret, caller_strings)
+        self.assertNotIn(body_secret, observer_graph)
+        self.assertEqual(server.route_observer_failures, 1)
+        self.assertEqual(server.dropped_route_error_events, 0)
+        self.assertEqual(len(hook_events), 1)
+        self.assertIsInstance(hook_events[0].exc_value, RuntimeError)
         self.assertTrue(received[0].startswith(b"HTTP/1.1 500 Internal Server Error\r\n"))
         self.assertNotIn(hostile_path.encode("ascii"), received[0])
         self.assertTrue(received[1].startswith(b"HTTP/1.1 200 OK\r\n"))

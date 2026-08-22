@@ -111,6 +111,10 @@ def main() -> None:
         parser.error("--iterations must be positive")
     if arguments.rounds <= 0:
         parser.error("--rounds must be positive")
+    if arguments.release and arguments.iterations < 10_000:
+        parser.error("--release requires at least 10000 iterations")
+    if arguments.release and arguments.rounds < 5:
+        parser.error("--release requires at least 5 rounds")
     result = asyncio.run(benchmark(arguments.iterations, arguments.rounds))
     print(json.dumps(result, indent=2, sort_keys=True))
     if arguments.release and not result["static_dispatch_floor_passed"]:
