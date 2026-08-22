@@ -6,6 +6,7 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 import importlib
 import math
+import re
 import time
 from types import MappingProxyType
 from typing import Any
@@ -26,6 +27,10 @@ class RouteMatchTimeout(RuntimeError):
     def __init__(self, route_id: str) -> None:
         self.route_id = route_id
         super().__init__("regular-expression route matching timed out ({})".format(route_id))
+
+
+class RoutePathTooLarge(RuntimeError):
+    """Raised before matching when a request path exceeds its routing bound."""
 
 
 @dataclass(frozen=True)
@@ -64,7 +69,6 @@ class _RegexRoute:
     pattern: str
     compiled: Any
     handlers: Mapping[str, Handler]
-    literal_prefix: str
 
 
 class Router:
@@ -110,7 +114,6 @@ class Router:
                 existing.pattern,
                 existing.compiled,
                 MappingProxyType(handlers),
-                existing.literal_prefix,
             )
             return
 
@@ -122,7 +125,6 @@ class Router:
             pattern,
             compiled,
             MappingProxyType({method: handler for method in methods}),
-            _literal_prefix(pattern),
         )
         self._regex_by_pattern[pattern] = len(self._regex)
         self._regex.append(route)
@@ -167,11 +169,6 @@ class Router:
             raise ValueError("regex route pattern must start with a literal '/'")
         if len(pattern) > self.regex_config.max_pattern_length:
             raise ValueError("regex route pattern is too long")
-        names = _named_group_names(pattern)
-        if len(names) != len(set(names)):
-            raise ValueError("regex route pattern contains duplicate named groups")
-        if len(names) > self.regex_config.max_named_captures:
-            raise ValueError("regex route pattern has too many named captures")
         try:
             engine = importlib.import_module("regex")
         except ImportError as exc:
@@ -179,15 +176,17 @@ class Router:
                 "regular-expression routes require 'smallserver[regex-routes]'"
             ) from exc
         try:
-            compiled = engine.compile(pattern)
+            compiled = engine.compile("(?=/)(?:{})".format(pattern))
         except Exception:
             raise ValueError("invalid regex route pattern") from None
-        try:
-            empty_match = compiled.fullmatch("", timeout=self.regex_config.match_timeout)
-        except TimeoutError as exc:
-            raise ValueError("regex route pattern validation timed out") from exc
-        if empty_match is not None:
-            raise ValueError("regex route pattern must not match an empty path")
+        names = _named_group_names(pattern)
+        compiled_names = set(compiled.groupindex)
+        if set(names) != compiled_names:
+            raise ValueError("regex route named groups could not be validated")
+        if len(names) != len(compiled_names):
+            raise ValueError("regex route pattern contains duplicate named groups")
+        if len(compiled_names) > self.regex_config.max_named_captures:
+            raise ValueError("regex route pattern has too many named captures")
         return compiled
 
     def _validate_path(self, path: str) -> None:
@@ -196,14 +195,12 @@ class Router:
         except UnicodeEncodeError as exc:
             raise ValueError("request path must contain ASCII characters only") from exc
         if size > self.regex_config.max_path_bytes:
-            raise ValueError("request path is too large for routing")
+            raise RoutePathTooLarge("request path is too large for routing")
 
     def _match(self, route: _RegexRoute, path: str, deadline: float) -> Any:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise RouteMatchTimeout(route.route_id)
-        if len(route.literal_prefix) > 1 and not path.startswith(route.literal_prefix):
-            return None
         timeout = min(float(self.regex_config.match_timeout), remaining)
         try:
             return route.compiled.fullmatch(path, timeout=timeout)
@@ -215,18 +212,10 @@ def _captures(match: Any) -> dict[str, str]:
     return {name: value for name, value in match.groupdict().items() if value is not None}
 
 
-def _literal_prefix(pattern: str) -> str:
-    """Return only the leading literals that are safe to use as a rejection index."""
-    special = frozenset(".[](){}*+?|^$\\")
-    end = 0
-    while end < len(pattern) and pattern[end] not in special:
-        end += 1
-    return pattern[:end]
-
-
 def _named_group_names(pattern: str) -> list[str]:
-    """Find named-group declarations while ignoring escapes and character classes."""
+    """Find declarations while honoring regex comments and scoped verbose mode."""
     names: list[str] = []
+    verbose_stack = [False]
     escaped = False
     in_class = False
     index = 0
@@ -248,18 +237,59 @@ def _named_group_names(pattern: str) -> list[str]:
             in_class = False
             index += 1
             continue
-        marker_length = 0
-        if not in_class and pattern.startswith("(?P<", index):
-            marker_length = 4
-        elif not in_class and pattern.startswith("(?<", index):
-            next_character = pattern[index + 3 : index + 4]
-            if next_character not in ("=", "!"):
-                marker_length = 3
-        if marker_length:
-            end = pattern.find(">", index + marker_length)
-            if end >= 0:
-                names.append(pattern[index + marker_length : end])
-                index = end + 1
+        if not in_class and verbose_stack[-1] and character == "#":
+            newline = pattern.find("\n", index + 1)
+            index = len(pattern) if newline < 0 else newline + 1
+            continue
+        if not in_class and pattern.startswith("(?#", index):
+            index = _comment_end(pattern, index + 3)
+            continue
+        if not in_class and character == "(":
+            flags = re.match(r"\(\?([A-Za-z]*)(?:-([A-Za-z]*))?([:)])", pattern[index:])
+            if flags is not None:
+                enabled, disabled, delimiter = flags.groups()
+                verbose = (verbose_stack[-1] or "x" in enabled) and "x" not in (disabled or "")
+                index += flags.end()
+                if delimiter == ":":
+                    verbose_stack.append(verbose)
+                else:
+                    verbose_stack[-1] = verbose
                 continue
+            marker_length = 0
+            if pattern.startswith("(?P<", index):
+                marker_length = 4
+            elif pattern.startswith("(?<", index):
+                next_character = pattern[index + 3 : index + 4]
+                if next_character not in ("=", "!"):
+                    marker_length = 3
+            if marker_length:
+                end = pattern.find(">", index + marker_length)
+                if end >= 0:
+                    names.append(pattern[index + marker_length : end])
+                    verbose_stack.append(verbose_stack[-1])
+                    index = end + 1
+                    continue
+            verbose_stack.append(verbose_stack[-1])
+            index += 1
+            continue
+        if not in_class and character == ")":
+            if len(verbose_stack) > 1:
+                verbose_stack.pop()
+            index += 1
+            continue
         index += 1
     return names
+
+
+def _comment_end(pattern: str, index: int) -> int:
+    escaped = False
+    while index < len(pattern):
+        character = pattern[index]
+        if escaped:
+            escaped = False
+        elif character == "\\":
+            escaped = True
+        elif character == ")":
+            return index + 1
+        index += 1
+    return index

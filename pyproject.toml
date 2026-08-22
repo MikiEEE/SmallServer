@@ -14,7 +14,7 @@ dependencies = []
 
 [project.optional-dependencies]
 dev = ["build>=1.2"]
-regex-routes = ["regex>=2023.10.3"]
+regex-routes = ["regex>=2023.10.3,<2027"]
 
 [tool.setuptools.packages.find]
 include = ["smallserver*"]

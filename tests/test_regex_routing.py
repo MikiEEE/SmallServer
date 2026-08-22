@@ -12,12 +12,17 @@ from smallserver import (
     RouteMatchTimeout,
     SmallServer,
 )
+from smallserver.routing import Router
 
 
 HAS_REGEX = importlib.util.find_spec("regex") is not None
 
 
 class OptionalRegexDependencyTests(unittest.TestCase):
+    def test_error_observer_must_be_callable(self) -> None:
+        with self.assertRaisesRegex(TypeError, "route_error_observer"):
+            SmallServer(route_error_observer=object())  # type: ignore[arg-type]
+
     def test_static_routes_do_not_import_optional_engine(self) -> None:
         app = SmallServer()
 
@@ -87,6 +92,51 @@ class RegexRoutingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual((await app.dispatch(Request("GET", "/items/7", Headers()))).body, b"static")
         self.assertEqual((await app.dispatch(Request("GET", "/items/8", Headers()))).body, b"broad")
+
+    async def test_alternation_and_optional_literals_preserve_order_and_405(self) -> None:
+        app = SmallServer()
+
+        @app.get_regex(r"/foo|/bar")
+        async def top_level(request):
+            return Response.text("top")
+
+        @app.get_regex(r"/fo?bar")
+        async def optional(request):
+            return Response.text("optional")
+
+        @app.get_regex(r"/(?:red|blue)")
+        async def nested(request):
+            return Response.text("nested")
+
+        for path, expected in (
+            ("/foo", b"top"),
+            ("/bar", b"top"),
+            ("/fbar", b"optional"),
+            ("/fobar", b"optional"),
+            ("/red", b"nested"),
+            ("/blue", b"nested"),
+        ):
+            with self.subTest(path=path):
+                self.assertEqual((await app.dispatch(Request("GET", path, Headers()))).body, expected)
+        response = await app.dispatch(Request("POST", "/bar", Headers()))
+        self.assertEqual(response.status, 405)
+        self.assertEqual(response.headers["allow"], "GET")
+
+    def test_compiled_routes_are_structurally_guarded_to_slash_paths(self) -> None:
+        async def handler(request):
+            return Response()
+
+        for pattern, slash_path, non_slash_path in (
+            (r"/foo|bar", "/foo", "bar"),
+            (r"/?foo", "/foo", "foo"),
+        ):
+            with self.subTest(pattern=pattern):
+                router = Router()
+                router.add_regex(pattern, ("GET",), handler)
+                self.assertIs(router.resolve("GET", slash_path).handler, handler)
+                miss = router.resolve("GET", non_slash_path)
+                self.assertIsNone(miss.handler)
+                self.assertEqual(miss.allowed_methods, ())
 
     async def test_method_first_matching_and_sorted_allow(self) -> None:
         app = SmallServer()
@@ -162,6 +212,19 @@ class RegexRoutingTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "maximum"):
             limited.get_regex(r"/two")(handler)
 
+    async def test_verbose_comment_group_text_does_not_create_false_duplicate(self) -> None:
+        app = SmallServer()
+
+        @app.get_regex(
+            "/(?x:items/ # (?P<item_id>this is comment text)\n"
+            " (?P<item_id>[0-9]+))"
+        )
+        async def item(request):
+            return Response.text(request.path_params["item_id"])
+
+        response = await app.dispatch(Request("GET", "/items/42", Headers()))
+        self.assertEqual(response.body, b"42")
+
     async def test_catastrophic_backtracking_is_bounded_and_path_is_not_disclosed(self) -> None:
         app = SmallServer(RegexRouteConfig(match_timeout=0.001, total_match_timeout=0.005))
 
@@ -180,9 +243,9 @@ class RegexRoutingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_total_budget_bounds_many_individually_fast_misses(self) -> None:
         class SlowPattern:
+            groupindex = {}
+
             def fullmatch(self, value, timeout):
-                if not value:
-                    return None
                 time.sleep(min(timeout / 2, 0.001))
                 return None
 
@@ -207,14 +270,30 @@ class RegexRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(time.monotonic() - started, 0.05)
 
     async def test_manual_dispatch_path_limit_is_enforced_before_matching(self) -> None:
+        calls = []
+
+        class Pattern:
+            groupindex = {}
+
+            def fullmatch(self, value, timeout):
+                calls.append(value)
+                return None
+
+        class Engine:
+            @staticmethod
+            def compile(pattern):
+                return Pattern()
+
         app = SmallServer(RegexRouteConfig(max_path_bytes=8))
 
-        @app.get_regex(r"/.*")
         async def handler(request):
             return Response()
 
-        with self.assertRaisesRegex(ValueError, "too large"):
-            await app.dispatch(Request("GET", "/12345678", Headers()))
+        with patch("smallserver.routing.importlib.import_module", return_value=Engine()):
+            app.get_regex(r"/.*")(handler)
+        response = await app.dispatch(Request("GET", "/12345678", Headers()))
+        self.assertEqual(response.status, 414)
+        self.assertEqual(calls, [])
 
 
 class RegexRouteConfigTests(unittest.TestCase):
