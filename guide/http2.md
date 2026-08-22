@@ -8,7 +8,7 @@ to own task scheduling and all network readiness.
 
 ```bash
 python3 -m pip install -r requirements.txt
-python3 -m pip install -e '.[http2]'
+python3 -m pip install -e '.[test]'
 python3 examples/http2_prior_knowledge.py
 ```
 
@@ -32,13 +32,19 @@ single writer preserves frame ordering and observes peer flow-control windows.
 
 `HTTP2Config` bounds concurrent streams, decoded and compressed header sizes,
 per-stream and per-connection request buffering, response buffering, and frame
-size. Requests and responses use the same immutable `Request`, `Headers`, and
-`Response` values as HTTP/1.1. The request version is `"HTTP/2"`.
+size. Completed request bodies remain charged to the connection budget while
+their handler is running. `handshake_timeout` bounds receipt of the client
+preface and `idle_timeout` bounds inactive established connections; both use
+SmallOS scheduler timers. Requests and responses use the same immutable
+`Request`, `Headers`, and `Response` values as HTTP/1.1. The request version is
+`"HTTP/2"`.
 
 Peer stream resets cancel the associated handler task without stopping other
 streams. Protocol/resource violations reset the affected stream when possible.
 Connection shutdown emits GOAWAY and then releases the connection through the
-SmallOS kernel transport.
+SmallOS kernel transport. If a writer is already blocked on kernel
+writability, a lower-priority scheduler task force-closes the stream after the
+writer's graceful scheduling opportunity so shutdown remains bounded.
 
 ## Current protocol boundary
 
