@@ -496,6 +496,121 @@ class WebSocketLoopbackTests(unittest.TestCase):
         self.assertEqual(close_codes, [1002, 1009])
         self.assertTrue(server.finished)
 
+    def test_handshake_idle_and_pong_deadlines_are_bounded(self) -> None:
+        runtime = SmallOS().setKernel(Unix())
+        app = SmallServer(
+            websocket_config=WebSocketConfig(
+                max_frame_payload_bytes=1024,
+                max_message_bytes=1024,
+                handshake_timeout=0.1,
+                idle_timeout=0.2,
+                pong_timeout=0.05,
+                close_timeout=0.2,
+                deadline_resolution=0.01,
+            )
+        )
+
+        @app.websocket("/handshake-timeout")
+        async def handshake_timeout(websocket: WebSocket) -> None:
+            await runtime.cursor.sleep(1)
+
+        @app.websocket("/idle-timeout")
+        async def idle_timeout(websocket: WebSocket) -> None:
+            await websocket.accept()
+            await websocket.receive()
+
+        @app.websocket("/pong-timeout")
+        async def pong_timeout(websocket: WebSocket) -> None:
+            await websocket.accept()
+            await websocket.ping(b"deadline")
+            await websocket.receive()
+
+        try:
+            server = app.serve(runtime, host="127.0.0.1", port=0)
+        except PermissionError:
+            self.skipTest("the current sandbox does not permit loopback TCP binds")
+
+        api = _load_wsproto()
+        outcomes: dict[str, object] = {}
+        errors: list[BaseException] = []
+
+        def connect(path: str):
+            stream = socket.create_connection(("127.0.0.1", server.port), timeout=3)
+            stream.sendall(
+                "GET {} HTTP/1.1\r\nHost: localhost\r\n"
+                "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                "Sec-WebSocket-Version: 13\r\n"
+                "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n".format(
+                    path
+                ).encode("ascii")
+            )
+            response = b""
+            while b"\r\n\r\n" not in response:
+                response += stream.recv(4096)
+            return stream, response
+
+        def client_work() -> None:
+            try:
+                stream, response = connect("/handshake-timeout")
+                outcomes["handshake"] = response
+                stream.close()
+
+                stream, response = connect("/idle-timeout")
+                outcomes["idle_handshake"] = response
+                idle_client = api.Connection(api.ConnectionType.CLIENT)
+                idle_events = _receive_events(
+                    stream, idle_client, api.CloseConnection
+                )
+                idle_close = next(
+                    event
+                    for event in idle_events
+                    if isinstance(event, api.CloseConnection)
+                )
+                outcomes["idle_code"] = idle_close.code
+                stream.sendall(idle_client.send(idle_close.response()))
+                stream.close()
+
+                stream, response = connect("/pong-timeout")
+                outcomes["pong_handshake"] = response
+                pong_client = api.Connection(api.ConnectionType.CLIENT)
+                ping_events = _receive_events(stream, pong_client, api.Ping)
+                outcomes["ping_payload"] = next(
+                    event.payload
+                    for event in ping_events
+                    if isinstance(event, api.Ping)
+                )
+                close_events = _receive_events(
+                    stream, pong_client, api.CloseConnection
+                )
+                pong_close = next(
+                    event
+                    for event in close_events
+                    if isinstance(event, api.CloseConnection)
+                )
+                outcomes["pong_code"] = pong_close.code
+                stream.sendall(pong_client.send(pong_close.response()))
+                stream.close()
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                server.close()
+
+        worker = threading.Thread(target=client_work, daemon=True)
+        worker.start()
+        runtime.start()
+        worker.join(timeout=5)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertIn(b"HTTP/1.1 408 Request Timeout", outcomes["handshake"])
+        self.assertIn(
+            b"HTTP/1.1 101 Switching Protocols", outcomes["idle_handshake"]
+        )
+        self.assertEqual(outcomes["idle_code"], 1001)
+        self.assertEqual(outcomes["ping_payload"], b"deadline")
+        self.assertEqual(outcomes["pong_code"], 1002)
+        self.assertTrue(server.finished)
+
     def test_server_shutdown_attempts_close_and_releases_children(self) -> None:
         api = _load_wsproto()
         runtime = SmallOS().setKernel(Unix())
