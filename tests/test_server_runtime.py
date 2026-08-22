@@ -63,6 +63,10 @@ class SmallOSServerIntegrationTests(unittest.TestCase):
             b"".join(received),
             b"HTTP/1.1 200 OK\r\nContent-Length: 15\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"status\":\"ok\"}",
         )
+        self.assertEqual(runtime.ioReadWaiters, {})
+        self.assertEqual(runtime.ioWriteWaiters, {})
+        self.assertIsNone(runtime._io_wait_set)
+        self.assertTrue(server._listener.closed)
 
     def test_blocking_adapter_does_not_block_unrelated_connection(self) -> None:
         runtime = SmallOS().setKernel(Unix())
@@ -127,3 +131,53 @@ class SmallOSServerIntegrationTests(unittest.TestCase):
             self.assertEqual(errors, [])
             self.assertIn(b"\r\n\r\nfast done", responses["fast"])
             self.assertIn(b"\r\n\r\nslow done", responses["slow"])
+
+    def test_slow_client_does_not_block_a_complete_request(self) -> None:
+        runtime = SmallOS().setKernel(Unix())
+        app = SmallServer()
+
+        @app.get("/fast")
+        async def fast(request):
+            return Response.text("fast")
+
+        try:
+            server = app.serve(runtime, host="127.0.0.1", port=0)
+        except PermissionError:
+            self.skipTest("the current sandbox does not permit loopback TCP binds")
+
+        received: list[bytes] = []
+        errors: list[BaseException] = []
+
+        def clients() -> None:
+            slow = None
+            try:
+                slow = socket.create_connection(("127.0.0.1", server.port), timeout=2)
+                slow.sendall(b"GET /slow HTTP/1.1\r\nHost: local")
+                with socket.create_connection(("127.0.0.1", server.port), timeout=2) as fast_client:
+                    fast_client.sendall(b"GET /fast HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                    while True:
+                        chunk = fast_client.recv(4096)
+                        if not chunk:
+                            break
+                        received.append(chunk)
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                if slow is not None:
+                    slow.close()
+                server.close()
+
+        worker = threading.Thread(target=clients, daemon=True)
+        worker.start()
+        runtime.start()
+        worker.join(timeout=2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            b"".join(received),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nContent-Type: text/plain; charset=utf-8\r\n"
+            b"Connection: close\r\n\r\nfast",
+        )
+        self.assertEqual(runtime.ioReadWaiters, {})
+        self.assertEqual(runtime.ioWriteWaiters, {})

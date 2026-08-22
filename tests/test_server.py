@@ -67,16 +67,33 @@ class HTTPRequestParserTests(unittest.TestCase):
         self.assertEqual(runtime.kernel.wakeup.close_calls, 1)
 
     def test_serve_closes_kernel_resources_when_task_construction_fails(self) -> None:
+        from SmallPackage import SmallTask as RealSmallTask
+
         class Runtime:
             def __init__(self) -> None:
                 self.kernel = FakeKernel()
+                self.cancelled = []
 
             def resume_task(self, task) -> None:
                 pass
 
+            def cancel_task(self, task) -> None:
+                self.cancelled.append(task)
+                task.cancel()
+
+        calls = 0
+
+        def construct_task(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("task failed")
+            return RealSmallTask(*args, **kwargs)
+
         runtime = Runtime()
-        with patch("SmallPackage.SmallTask", side_effect=RuntimeError("task failed")):
+        with patch("SmallPackage.SmallTask", side_effect=construct_task):
             with self.assertRaisesRegex(RuntimeError, "task failed"):
                 SmallServer().serve(runtime)
+        self.assertEqual(len(runtime.cancelled), 1)
         self.assertEqual([handle.name for handle in runtime.kernel.closed], ["listener"])
         self.assertEqual(runtime.kernel.wakeup.close_calls, 1)

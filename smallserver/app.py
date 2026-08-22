@@ -6,7 +6,7 @@ import inspect
 from collections.abc import Awaitable, Callable, Iterable
 from typing import Any
 
-from ._transport import KernelTransport
+from ._transport import KernelTransport, TransportHandle
 from .errors import HTTPError
 from .http import Request, Response
 from .server import HTTPParseError, HTTPRequestParser, ServerConfig, ServerHandle
@@ -81,7 +81,7 @@ class SmallServer:
         listener = transport.open_listener(host, port, config.max_connections)
         try:
             wakeup = transport.create_wakeup_channel()
-        except Exception:
+        except BaseException:
             transport.close_safely(listener)
             raise
         handle = ServerHandle(runtime, transport, listener, wakeup, config)
@@ -94,14 +94,15 @@ class SmallServer:
                 name="smallserver-listener",
             )
             tasks = (listener_task,)
-            close_task = SmallTask(
-                config.listener_priority,
-                self._close_watcher,
-                args=(handle,),
-                name="smallserver-close-watcher",
-            )
             handle._listener_task = listener_task
-            tasks = (listener_task, close_task)
+            if wakeup is not None:
+                close_task = SmallTask(
+                    config.listener_priority,
+                    self._close_watcher,
+                    args=(handle,),
+                    name="smallserver-close-watcher",
+                )
+                tasks = (listener_task, close_task)
             runtime.fork(list(tasks))
         except BaseException:
             handle._abort_startup(tasks)
@@ -128,49 +129,58 @@ class SmallServer:
             return Response.text(exc.detail or "HTTP {}".format(exc.status), status=exc.status)
 
     async def _accept_loop(self, task: Any, handle: ServerHandle) -> None:
+        accepted_in_batch = 0
         while not handle.closed:
             try:
                 accepted = await handle._transport.accept(task, handle._listener)
-            except Exception:
-                return
+            except Exception as exc:
+                if handle.closed:
+                    return
+                handle._listener_failed(exc, task)
+                raise
             client = accepted.stream
+            accepted_in_batch += 1
             if handle.closed or len(handle._connections) >= handle._config.max_connections:
                 handle._transport.close_safely(client)
-                continue
-            from SmallPackage import SmallTask
+            else:
+                from SmallPackage import SmallTask
 
-            connection_task: Any = None
-            try:
-                connection_task = SmallTask(
-                    handle._config.connection_priority,
-                    self._connection_loop,
-                    args=(handle, client),
-                    name="smallserver-connection",
-                )
-                handle._connections[id(client)] = (client, connection_task)
-                runtime = handle._runtime
-                runtime.fork(connection_task)
-            except Exception:
-                handle._connections.pop(id(client), None)
-                if connection_task is not None:
-                    cancel_task = getattr(handle._runtime, "cancel_task", None)
-                    if callable(cancel_task):
-                        try:
-                            cancel_task(connection_task)
-                        except Exception:
-                            pass
-                handle._transport.close_safely(client)
-                continue
+                connection_task: Any = None
+                try:
+                    connection_task = SmallTask(
+                        handle._config.connection_priority,
+                        self._connection_loop,
+                        args=(handle, client),
+                        name="smallserver-connection",
+                    )
+                    handle._connections[id(client)] = (client, connection_task)
+                    runtime = handle._runtime
+                    runtime.fork(connection_task)
+                except Exception:
+                    handle._connections.pop(id(client), None)
+                    if connection_task is not None:
+                        cancel_task = getattr(handle._runtime, "cancel_task", None)
+                        if callable(cancel_task):
+                            try:
+                                cancel_task(connection_task)
+                            except Exception:
+                                pass
+                    handle._transport.close_safely(client)
+            if accepted_in_batch >= handle._config.accept_batch_size:
+                accepted_in_batch = 0
+                await task.yield_now()
 
     async def _close_watcher(self, task: Any, handle: ServerHandle) -> None:
-        await task.wait_readable(handle._wakeup.wait_object)
         try:
+            assert handle._wakeup is not None
+            await task.wait_readable(handle._wakeup.wait_object)
             handle._wakeup.drain()
-        except Exception:
-            pass
-        handle._finish_close()
+        finally:
+            handle._finish_close(current_task=task)
 
-    async def _connection_loop(self, task: Any, handle: ServerHandle, client: object) -> None:
+    async def _connection_loop(
+        self, task: Any, handle: ServerHandle, client: TransportHandle
+    ) -> None:
         parser = HTTPRequestParser(
             handle._config.max_header_bytes,
             handle._config.max_header_count,
@@ -209,7 +219,7 @@ class SmallServer:
         self,
         task: Any,
         handle: ServerHandle,
-        client: object,
+        client: TransportHandle,
         response: Response,
     ) -> None:
         headers = {name: value for name, value in response.headers.items() if name.lower() != "connection"}

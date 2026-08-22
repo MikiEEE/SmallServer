@@ -3,10 +3,18 @@ from pathlib import Path
 import unittest
 
 from smallserver import Response, SmallServer
-from smallserver._transport import KernelTransport
+from smallserver._transport import KernelTransport, TransportHandle
 from smallserver.server import ServerConfig, ServerHandle
 
-from tests.kernel_fakes import FakeKernel, NeedsRead, NeedsWrite, OpaqueHandle
+from tests.kernel_fakes import (
+    FakeKernel,
+    NeedsRead,
+    NeedsWrite,
+    OpaqueHandle,
+    TLSWantRead,
+    TLSWantWrite,
+    WouldBlock,
+)
 
 
 def run_immediate(coroutine):
@@ -20,12 +28,16 @@ def run_immediate(coroutine):
 class FakeTask:
     def __init__(self) -> None:
         self.waits: list[tuple[str, object]] = []
+        self.yields = 0
 
     async def wait_readable(self, handle: object) -> None:
         self.waits.append(("read", handle))
 
     async def wait_writable(self, handle: object) -> None:
         self.waits.append(("write", handle))
+
+    async def yield_now(self) -> None:
+        self.yields += 1
 
 
 class KernelTransportTests(unittest.TestCase):
@@ -35,14 +47,11 @@ class KernelTransportTests(unittest.TestCase):
             KernelTransport(kernel)
         self.assertEqual(kernel.calls, [("supports_tcp_server",)])
 
-    def test_wakeup_capability_failure_happens_before_address_resolution(self) -> None:
+    def test_kernel_without_wakeup_support_retains_scheduler_close_path(self) -> None:
         kernel = FakeKernel(wakeup_supported=False)
-        with self.assertRaisesRegex(NotImplementedError, "wakeup channels"):
-            KernelTransport(kernel)
-        self.assertEqual(
-            kernel.calls,
-            [("supports_tcp_server",), ("supports_wakeup_channel",)],
-        )
+        transport = KernelTransport(kernel)
+        self.assertFalse(transport.supports_wakeup_channel)
+        self.assertIsNone(transport.create_wakeup_channel())
 
     def test_incomplete_contract_fails_before_address_resolution(self) -> None:
         kernel = FakeKernel()
@@ -66,6 +75,19 @@ class KernelTransportTests(unittest.TestCase):
         self.assertIs(bind_call[2], kernel.address_info)
         self.assertEqual(kernel.closed, [kernel.listener])
 
+    def test_listener_rollback_catches_base_exception_and_preserves_primary_error(self) -> None:
+        class FatalSetup(BaseException):
+            pass
+
+        kernel = FakeKernel()
+        primary = FatalSetup("setup interrupted")
+        kernel.operation_errors["listen"] = primary
+        kernel.close_failures[id(kernel.listener)] = 1
+        transport = KernelTransport(kernel)
+        with self.assertRaises(FatalSetup) as raised:
+            transport.open_listener("127.0.0.1", 0, 1)
+        self.assertIs(raised.exception, primary)
+
     def test_accept_and_stream_operations_honor_both_retry_directions(self) -> None:
         kernel = FakeKernel()
         transport = KernelTransport(kernel)
@@ -76,11 +98,12 @@ class KernelTransportTests(unittest.TestCase):
         kernel.send_results[id(client)] = [NeedsRead(), NeedsWrite(), 2, 3]
         task = FakeTask()
 
-        accepted = run_immediate(transport.accept(task, kernel.listener))
-        received = run_immediate(transport.recv(task, client, 16))
-        run_immediate(transport.send_all(task, client, b"reply"))
+        listener = TransportHandle(kernel.listener)
+        accepted = run_immediate(transport.accept(task, listener))
+        received = run_immediate(transport.recv(task, accepted.stream, 16))
+        run_immediate(transport.send_all(task, accepted.stream, b"reply"))
 
-        self.assertIs(accepted.stream, client)
+        self.assertIs(accepted.stream.raw, client)
         self.assertEqual(accepted.peer_address, fallback_peer)
         self.assertEqual(received, b"request")
         self.assertEqual(
@@ -88,6 +111,26 @@ class KernelTransportTests(unittest.TestCase):
             ["read", "write", "write", "read", "read", "write"],
         )
         self.assertEqual(kernel.sent[id(client)][-1], b"ply")
+        self.assertTrue(all(isinstance(part, memoryview) for part in kernel.sent[id(client)]))
+
+    def test_operation_aware_retry_maps_eagain_and_tls_opposite_directions(self) -> None:
+        kernel = FakeKernel()
+        transport = KernelTransport(kernel)
+        listener = TransportHandle(kernel.listener)
+        client = OpaqueHandle("client")
+        kernel.accept_results = [WouldBlock(11, "EAGAIN"), (client, None)]
+        kernel.recv_results[id(client)] = [WouldBlock(11, "EAGAIN"), TLSWantWrite(), b"ok"]
+        kernel.send_results[id(client)] = [WouldBlock(11, "EAGAIN"), TLSWantRead(), 2]
+        task = FakeTask()
+
+        accepted = run_immediate(transport.accept(task, listener))
+        run_immediate(transport.recv(task, accepted.stream, 2))
+        run_immediate(transport.send_all(task, accepted.stream, b"ok"))
+
+        self.assertEqual(
+            [mode for mode, _ in task.waits],
+            ["read", "read", "write", "write", "read"],
+        )
 
     def test_accept_configuration_failure_closes_the_new_stream_once(self) -> None:
         kernel = FakeKernel()
@@ -96,9 +139,20 @@ class KernelTransportTests(unittest.TestCase):
         kernel.accept_results = [(client, ("127.0.0.1", 1))]
         kernel.fail_operation = "setblocking"
         with self.assertRaisesRegex(RuntimeError, "setblocking failed"):
-            run_immediate(transport.accept(FakeTask(), kernel.listener))
-        transport.close_safely(client)
+            run_immediate(transport.accept(FakeTask(), TransportHandle(kernel.listener)))
         self.assertEqual(kernel.closed, [client])
+
+    def test_send_requires_forward_progress(self) -> None:
+        for result in (0, -1):
+            with self.subTest(result=result):
+                kernel = FakeKernel()
+                transport = KernelTransport(kernel)
+                client = OpaqueHandle("client")
+                kernel.send_results[id(client)] = [result]
+                with self.assertRaisesRegex(ConnectionError, "forward progress"):
+                    run_immediate(
+                        transport.send_all(FakeTask(), TransportHandle(client), b"payload")
+                    )
 
     def test_connection_registration_failure_cancels_task_and_closes_stream(self) -> None:
         class Runtime:
@@ -118,14 +172,56 @@ class KernelTransportTests(unittest.TestCase):
         handle = ServerHandle(
             Runtime(), transport, listener, transport.create_wakeup_channel(), ServerConfig()
         )
-        client = OpaqueHandle("client")
-        kernel.accept_results = [(client, ("127.0.0.1", 1)), RuntimeError("listener failed")]
+        clients = [OpaqueHandle("client-{}".format(index)) for index in range(4)]
+        kernel.accept_results = [
+            *((client, ("127.0.0.1", 1)) for client in clients),
+            RuntimeError("listener failed"),
+        ]
+        task = FakeTask()
+        handle._config = ServerConfig(accept_batch_size=2)
 
-        run_immediate(SmallServer()._accept_loop(FakeTask(), handle))
+        with self.assertRaisesRegex(RuntimeError, "listener failed"):
+            run_immediate(SmallServer()._accept_loop(task, handle))
 
-        self.assertEqual(len(handle._runtime.cancelled), 1)
-        self.assertEqual(kernel.closed, [client])
+        self.assertEqual(len(handle._runtime.cancelled), 4)
+        self.assertEqual(kernel.closed, clients)
         self.assertEqual(handle._connections, {})
+        self.assertEqual(task.yields, 2)
+        self.assertIsInstance(handle.failure, RuntimeError)
+        run_immediate(SmallServer()._close_watcher(FakeTask(), handle))
+        self.assertEqual(kernel.closed, clients + [listener.raw])
+
+    def test_full_capacity_accepts_are_batched_and_yield_fairly(self) -> None:
+        class Runtime:
+            def resume_task(self, task) -> None:
+                pass
+
+        kernel = FakeKernel()
+        transport = KernelTransport(kernel)
+        listener = transport.open_listener("127.0.0.1", 0, 1)
+        handle = ServerHandle(
+            Runtime(),
+            transport,
+            listener,
+            transport.create_wakeup_channel(),
+            ServerConfig(max_connections=1, accept_batch_size=2),
+        )
+        occupied = TransportHandle(OpaqueHandle("occupied"))
+        handle._connections[id(occupied)] = (occupied, object())
+        clients = [OpaqueHandle("overflow-{}".format(index)) for index in range(4)]
+        kernel.accept_results = [
+            *((client, None) for client in clients),
+            RuntimeError("listener failed"),
+        ]
+        task = FakeTask()
+
+        with self.assertRaisesRegex(RuntimeError, "listener failed"):
+            run_immediate(SmallServer()._accept_loop(task, handle))
+
+        self.assertEqual(task.yields, 2)
+        self.assertEqual(kernel.closed, clients)
+        run_immediate(SmallServer()._close_watcher(FakeTask(), handle))
+        self.assertEqual(kernel.closed, clients + [occupied.raw, listener.raw])
 
     def test_server_handle_signals_and_releases_each_resource_once(self) -> None:
         class Runtime:
@@ -145,19 +241,119 @@ class KernelTransportTests(unittest.TestCase):
         connection = OpaqueHandle("connection")
         connection_task = object()
         listener_task = object()
-        handle._connections[id(connection)] = (connection, connection_task)
+        owned_connection = TransportHandle(connection)
+        handle._connections[id(owned_connection)] = (owned_connection, connection_task)
         handle._listener_task = listener_task
 
         handle.close()
         handle.close()
         handle._finish_close()
         handle._finish_close()
-        transport.close_safely(connection)
+        transport.close_safely(owned_connection)
 
-        self.assertEqual(wakeup.notify_calls, 1)
-        self.assertEqual(wakeup.close_calls, 1)
+        self.assertEqual(kernel.wakeup.notify_calls, 1)
+        self.assertEqual(kernel.wakeup.close_calls, 1)
         self.assertEqual(runtime.resumed, [connection_task, listener_task])
-        self.assertEqual(kernel.closed, [connection, listener])
+        self.assertEqual(kernel.closed, [connection, listener.raw])
+
+    def test_notification_failure_can_be_retried_until_close_watcher_finishes(self) -> None:
+        class Runtime:
+            def resume_task(self, task) -> None:
+                pass
+
+        kernel = FakeKernel()
+        transport = KernelTransport(kernel)
+        handle = ServerHandle(
+            Runtime(),
+            transport,
+            transport.open_listener("127.0.0.1", 0, 1),
+            transport.create_wakeup_channel(),
+            ServerConfig(),
+        )
+        kernel.wakeup.notify_failures = 1
+        with self.assertRaisesRegex(RuntimeError, "notify failed"):
+            handle.close()
+        self.assertTrue(handle.closed)
+        handle.close()
+        self.assertEqual(kernel.wakeup.notify_calls, 2)
+        kernel.wakeup.drain_error = RuntimeError("drain failed")
+        with self.assertRaisesRegex(RuntimeError, "drain failed"):
+            run_immediate(SmallServer()._close_watcher(FakeTask(), handle))
+        self.assertEqual(kernel.closed, [kernel.listener])
+        self.assertEqual(kernel.wakeup.close_calls, 1)
+
+    def test_invalid_or_failing_wakeup_wait_object_closes_acquired_channel(self) -> None:
+        class FailingWaitChannel:
+            close_calls = 0
+
+            @property
+            def wait_object(self):
+                raise RuntimeError("wait object failed")
+
+            def notify(self):
+                pass
+
+            def drain(self):
+                pass
+
+            def close(self):
+                self.close_calls += 1
+
+        for property_failure in (True, False):
+            with self.subTest(property_failure=property_failure):
+                kernel = FakeKernel()
+                channel = FailingWaitChannel() if property_failure else kernel.wakeup
+                kernel.create_wakeup_channel = lambda: channel  # type: ignore[method-assign]
+                if not property_failure:
+                    kernel.invalid_wait_objects.add(id(channel.wait_object))
+                transport = KernelTransport(kernel)
+                with self.assertRaisesRegex((RuntimeError, ValueError), "wait object|invalid"):
+                    transport.create_wakeup_channel()
+                self.assertEqual(channel.close_calls, 1)
+
+    def test_no_wakeup_kernel_requires_explicit_scheduler_close(self) -> None:
+        class Runtime:
+            def __init__(self) -> None:
+                self.kernel = FakeKernel(wakeup_supported=False)
+                self.cursor = object()
+                self.resumed = []
+                self.forked = []
+
+            def fork(self, tasks) -> None:
+                self.forked.extend(tasks if isinstance(tasks, list) else [tasks])
+
+            def resume_task(self, task) -> None:
+                self.resumed.append(task)
+
+        runtime = Runtime()
+        handle = SmallServer().serve(runtime, host="0.0.0.0", port=8080)
+        self.assertEqual(len(runtime.forked), 1)
+        self.assertIsNone(handle._wakeup)
+
+        with self.assertRaisesRegex(RuntimeError, "outside its scheduler"):
+            handle.close()
+        self.assertFalse(handle.closed)
+        with self.assertRaisesRegex(RuntimeError, "currently running"):
+            run_immediate(handle.close_from_task(object()))
+        run_immediate(handle.close_from_task(runtime.cursor))
+        self.assertTrue(handle.closed)
+        self.assertEqual(runtime.kernel.closed, [runtime.kernel.listener])
+
+    def test_close_state_is_per_handle_and_failed_close_can_be_retried(self) -> None:
+        kernel = FakeKernel()
+        transport = KernelTransport(kernel)
+        raw = OpaqueHandle("connection")
+        handle = TransportHandle(raw)
+        kernel.close_failures[id(raw)] = 1
+        with self.assertRaisesRegex(RuntimeError, "close failed"):
+            transport.close(handle)
+        self.assertFalse(handle.closed)
+        transport.close(handle)
+        transport.close(handle)
+        self.assertTrue(handle.closed)
+        close_calls = [call for call in kernel.calls if call[:2] == ("socket_close", raw)]
+        self.assertEqual(len(close_calls), 2)
+        self.assertFalse(hasattr(transport, "_closed"))
 
     def test_fake_kernel_connection_preserves_http_response_bytes(self) -> None:
         class Runtime:
@@ -178,7 +374,8 @@ class KernelTransportTests(unittest.TestCase):
         async def health(request):
             return Response.json({"status": "ok"})
 
-        run_immediate(app._connection_loop(FakeTask(), handle, client))
+        owned_client = TransportHandle(client)
+        run_immediate(app._connection_loop(FakeTask(), handle, owned_client))
 
         self.assertEqual(
             kernel.sent[id(client)][0],
