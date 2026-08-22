@@ -11,9 +11,9 @@ A handler receives:
 - `path`: the request target, beginning with `/`;
 - `headers`: a case-insensitive `Headers` mapping;
 - `body`: complete request bytes;
-- `version`: `HTTP/1.1` for the current network server.
+- `version`: `HTTP/1.1` or `HTTP/2`, selected by the listener protocol.
 
-The base parser accepts one origin-form HTTP/1.1 request framed by zero or one
+The HTTP/1.1 parser accepts one origin-form request framed by zero or one
 `Content-Length` header. It rejects transfer encoding, multiple content lengths,
 missing `Host`, invalid targets, oversized input, and pipelined bytes. It does
 not decode JSON, forms, query parameters, or text for you.

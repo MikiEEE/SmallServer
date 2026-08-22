@@ -7,7 +7,7 @@ SmallServer in editable mode:
 
 ```console
 python3 -m pip install -r requirements.txt
-python3 -m pip install -e .
+python3 -m pip install -e '.[test]'
 ```
 
 For reproducible validation, put the canonical SmallOS checkout at the front of
@@ -26,6 +26,18 @@ The suite covers routing, HTTP values and parsing, adapters, lifecycle failure
 ownership, kernel transport behavior, and real loopback serving when the local
 environment permits binds. Documentation tests verify the tracked guide set,
 relative Markdown links, and Python code-block syntax.
+
+In a separate clean environment, verify the lazy optional-dependency boundary
+without installing the test or HTTP/2 extras:
+
+```console
+python3 -m pip install -r requirements.txt
+python3 -m pip install -e .
+python3 -m unittest tests.test_http2 -v
+```
+
+The dependency-contract tests run and HTTP/2 interoperability cases skip
+cleanly; importing and testing HTTP/1.1 must not require hyper-h2.
 
 Run the examples when their platform requirements are available:
 
