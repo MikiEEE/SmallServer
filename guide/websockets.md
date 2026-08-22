@@ -46,8 +46,15 @@ connection.
 An origin allowlist is strongly recommended when browser credentials or
 cookies are involved. A selected subprotocol must have been offered by the
 client and allowed by the route. Outbound saturation raises
-`WebSocketCapacityError`; peer or server closure raises `WebSocketDisconnect`
-from receive operations.
+`WebSocketCapacityError`.
+
+Direct calls to `receive()`, `receive_text()`, or `receive_bytes()` raise
+`WebSocketDisconnect` after already queued messages have been delivered when
+the peer or application closes the connection. `async for message in socket`
+instead treats that disconnect as normal iteration completion. Server shutdown
+and expired handshake, idle, Pong, write, or close deadlines may cancel the
+connection handler to guarantee bounded cleanup, so application resource
+cleanup belongs in the handler's `finally` block.
 
 Send calls complete after the serialized frame bytes have been flushed through
 the connection writer. They do not mean the peer application has processed the
@@ -56,3 +63,8 @@ message.
 This release does not implement `wss://` termination, compression, custom
 extensions, or RFC 8441 WebSockets over HTTP/2. Put TLS at a trusted reverse
 proxy until SmallServer gains a native TLS boundary.
+
+The runnable [`websocket_echo.py`](../examples/websocket_echo.py) accepts
+clients without requiring a subprotocol. The `/chat` example above separately
+demonstrates explicit negotiation: a client must offer `chat.v1` before the
+handler may select it.

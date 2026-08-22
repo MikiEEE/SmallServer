@@ -13,9 +13,9 @@ app = SmallServer(
 )
 
 
-@app.websocket("/echo", subprotocols=("echo.v1",))
+@app.websocket("/echo")
 async def echo(socket: WebSocket) -> None:
-    await socket.accept(subprotocol="echo.v1")
+    await socket.accept()
     async for message in socket:
         if message.is_text:
             await socket.send_text(message.text)

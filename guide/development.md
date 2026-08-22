@@ -41,8 +41,9 @@ python3 examples/manual_runtime.py
 python3 examples/websocket_echo.py
 ```
 
-The two network examples block until shutdown. `adapters_demo.py` completes on
-its own and demonstrates SQLite thread affinity and a persistent asyncio loop.
+The three network examples block until shutdown. `adapters_demo.py` completes
+on its own and demonstrates SQLite thread affinity and a persistent asyncio
+loop.
 
 ## Contribution boundaries
 
