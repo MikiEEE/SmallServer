@@ -44,6 +44,22 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(seen[0].path, "/items")
         self.assertEqual(seen[0].query_string, "tag=a%2Fb")
 
+    async def test_static_dispatch_passes_original_request_without_route_context_copy(self) -> None:
+        app = SmallServer()
+        seen = []
+
+        @app.get("/health")
+        async def health(request):
+            seen.append(request)
+            return Response()
+
+        request = Request("GET", "/health", Headers())
+        response = await app.dispatch(request)
+        self.assertEqual(response.status, 200)
+        self.assertIs(seen[0], request)
+        self.assertIsNone(seen[0].route_pattern)
+        self.assertEqual(dict(seen[0].path_params), {})
+
     async def test_http_error_becomes_response(self) -> None:
         app = SmallServer()
 

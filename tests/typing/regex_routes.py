@@ -1,10 +1,10 @@
 """Public typing fixture for mypy/pyright and compile-only release checks."""
 
-from smallserver import Request, Response, RouteMatchTimeout, SmallServer
+from smallserver import Request, Response, RouteErrorEvent, SmallServer
 
 
-def observe(error: RouteMatchTimeout) -> None:
-    route_id: str = error.route_id
+def observe(event: RouteErrorEvent) -> None:
+    route_id: str = event.route_id
     assert route_id
 
 

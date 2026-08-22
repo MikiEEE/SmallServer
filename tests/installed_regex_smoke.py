@@ -2,10 +2,12 @@
 
 import asyncio
 
-from smallserver import Headers, Request, Response, SmallServer
+from smallserver import Headers, Request, Response, RouteErrorEvent, SmallServer
 
 
 async def main() -> None:
+    event = RouteErrorEvent("regex-route-smoke", "route_match_timeout")
+    assert (event.route_id, event.category) == ("regex-route-smoke", "route_match_timeout")
     app = SmallServer()
 
     @app.get_regex(r"/users/(?P<user_id>[0-9]+)")

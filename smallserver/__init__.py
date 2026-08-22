@@ -4,7 +4,13 @@ from .app import SmallServer
 from .adapters import AdapterRegistry, AdapterShutdownError, http_error_from_adapter
 from .errors import HTTPError
 from .http import Headers, Request, Response
-from .routing import RegexRouteConfig, RegexRoutesUnavailable, RouteMatchTimeout, RoutePathTooLarge
+from .routing import (
+    RegexRouteConfig,
+    RegexRoutesUnavailable,
+    RouteErrorEvent,
+    RouteMatchTimeout,
+    RoutePathTooLarge,
+)
 from .server import ServerConfig, ServerHandle
 
 __all__ = [
@@ -16,6 +22,7 @@ __all__ = [
     "RegexRoutesUnavailable",
     "Request",
     "Response",
+    "RouteErrorEvent",
     "RouteMatchTimeout",
     "RoutePathTooLarge",
     "ServerConfig",
