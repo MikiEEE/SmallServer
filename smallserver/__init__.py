@@ -18,6 +18,15 @@ from .routing import (
     RoutePathTooLarge,
 )
 from .server import ServerConfig, ServerHandle
+from .websocket import (
+    WebSocket,
+    WebSocketCapacityError,
+    WebSocketConfig,
+    WebSocketDisconnect,
+    WebSocketMessage,
+    WebSocketStateError,
+    WebSocketUnavailable,
+)
 
 if TYPE_CHECKING:
     from .adapters import AdapterRegistry, AdapterShutdownError, http_error_from_adapter
@@ -51,5 +60,12 @@ __all__ = [
     "ServerHandle",
     "ServerStartupError",
     "SmallServer",
+    "WebSocket",
+    "WebSocketCapacityError",
+    "WebSocketConfig",
+    "WebSocketDisconnect",
+    "WebSocketMessage",
+    "WebSocketStateError",
+    "WebSocketUnavailable",
     "http_error_from_adapter",
 ]

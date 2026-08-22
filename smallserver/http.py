@@ -11,14 +11,18 @@ from typing import Any
 
 _TOKEN = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 _REASONS = {
+    101: "Switching Protocols",
     200: "OK",
     201: "Created",
     204: "No Content",
     400: "Bad Request",
+    403: "Forbidden",
     404: "Not Found",
     405: "Method Not Allowed",
     413: "Payload Too Large",
     414: "URI Too Long",
+    408: "Request Timeout",
+    426: "Upgrade Required",
     500: "Internal Server Error",
     503: "Service Unavailable",
 }
