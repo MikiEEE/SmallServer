@@ -31,13 +31,21 @@ class HTTPRequestParser:
         max_header_count: int,
         max_body_bytes: int,
         max_request_target_bytes: int = 8 * 1024,
+        preserve_trailing_data: bool = False,
     ) -> None:
         self._max_header_bytes = max_header_bytes
         self._max_header_count = max_header_count
         self._max_body_bytes = max_body_bytes
         self._max_request_target_bytes = max_request_target_bytes
+        self._preserve_trailing_data = preserve_trailing_data
         self._buffer = bytearray()
         self._request_head: tuple[str, str, Headers, int] | None = None
+        self._trailing_data = b""
+
+    @property
+    def trailing_data(self) -> bytes:
+        """Bytes received after the request body for an explicit protocol handoff."""
+        return self._trailing_data
 
     def feed(self, data: bytes) -> Request | None:
         self._buffer.extend(data)
@@ -54,17 +62,19 @@ class HTTPRequestParser:
             del self._buffer[:header_length]
 
         method, raw_target, headers, content_length = self._request_head
-        if len(self._buffer) > content_length:
+        if len(self._buffer) > content_length and not self._preserve_trailing_data:
             raise HTTPParseError(400, "pipelined requests are not supported")
         if len(self._buffer) < content_length:
             return None
         try:
             path, separator, query_string = raw_target.partition("?")
+            body = bytes(self._buffer[:content_length])
+            self._trailing_data = bytes(self._buffer[content_length:])
             return Request(
                 method,
                 path,
                 headers,
-                bytes(self._buffer),
+                body,
                 "HTTP/1.1",
                 raw_target=raw_target,
                 query_string=query_string if separator else "",
@@ -177,19 +187,26 @@ class RouteObserverChannel:
         self.accepting = False
         self.dropped += len(self.events)
         self.events.clear()
+        if self.task is not None:
+            accept_signal = getattr(self.task, "acceptSignal", None)
+            if callable(accept_signal):
+                accept_signal(_ROUTE_OBSERVER_SIGNAL)
 
 
 async def run_route_observer(task: Any, channel: RouteObserverChannel) -> None:
     """Drain sanitized events on a dedicated SmallOS task."""
-    while channel.accepting:
-        while channel.events:
-            event = channel.events.popleft()
-            try:
-                channel.observer(event)
-            except BaseException:
-                channel.failures += 1
-        if channel.accepting:
-            await task.wait_signal(_ROUTE_OBSERVER_SIGNAL)
+    try:
+        while channel.accepting:
+            while channel.events:
+                event = channel.events.popleft()
+                try:
+                    channel.observer(event)
+                except BaseException:
+                    channel.failures += 1
+            if channel.accepting:
+                await task.wait_signal(_ROUTE_OBSERVER_SIGNAL)
+    finally:
+        channel.task = None
 
 
 class ServerHandle:
@@ -229,6 +246,7 @@ class ServerHandle:
         self._connections: dict[int, tuple[TransportHandle, Any]] = {}
         self._closing_connections: dict[int, TransportHandle] = {}
         self._pending_task_cancellations: dict[int, Any] = {}
+        self._websocket_states: dict[int, Any] = {}
         self._capacity_waiting = False
 
     @property
@@ -335,6 +353,10 @@ class ServerHandle:
             return
         self._close_requested = True
         self._finalization_attempted = True
+        for state in tuple(self._websocket_states.values()):
+            request_shutdown = getattr(state, "request_shutdown", None)
+            if callable(request_shutdown):
+                request_shutdown()
         self._finish_close(current_task=task)
 
     def _listener_failed(self, exc: BaseException, task: Any) -> None:
@@ -369,6 +391,10 @@ class ServerHandle:
             return
         self._close_requested = True
         self._finalization_attempted = True
+        for state in tuple(self._websocket_states.values()):
+            request_shutdown = getattr(state, "request_shutdown", None)
+            if callable(request_shutdown):
+                request_shutdown()
         channel = self._route_observer_channel
         if channel is not None and channel.accepting:
             channel.stop()
@@ -402,6 +428,7 @@ class ServerHandle:
                 self._cancelled_task_ids.add(identity)
 
         for identity, (connection, task) in list(self._connections.items()):
+            websocket_owned = identity in self._websocket_states
             if owner_thread:
                 if (
                     task is not current_task
@@ -416,6 +443,10 @@ class ServerHandle:
                     self._runtime.resume_task(task)
                 except BaseException:
                     pass
+                if websocket_owned:
+                    # The live coordinator owns its bounded Close handshake
+                    # and releases the stream through _connection_finished().
+                    continue
             if task is not current_task:
                 self._connections.pop(identity, None)
                 self._close_or_retain(connection, current_task)
@@ -546,6 +577,7 @@ class ServerHandle:
             and not self._connections
             and not self._closing_connections
             and not self._pending_task_cancellations
+            and not self._websocket_states
         )
         if self._finished:
             self._cleanup_errors.clear()
