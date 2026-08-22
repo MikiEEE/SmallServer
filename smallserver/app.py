@@ -683,6 +683,8 @@ class SmallServer:
                         if handler is not None:
                             handle._cancel_or_retain_task(handler)
                     for item in ready:
+                        if not protocol.is_stream_active(item.stream_id):
+                            continue
                         handler = SmallTask(
                             handle._config.connection_priority,
                             self._http2_handler,

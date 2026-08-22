@@ -63,9 +63,9 @@ class HTTP2Config:
             raise ValueError(
                 "max_control_output_bytes cannot exceed max_pending_output_bytes"
             )
-        if self.max_control_output_bytes < 9:
+        if self.max_control_output_bytes < 51:
             raise ValueError(
-                "max_control_output_bytes must allow one HTTP/2 control frame"
+                "max_control_output_bytes must allow initial HTTP/2 settings"
             )
 
 
@@ -301,6 +301,7 @@ class H2Protocol:
         self._pending_output_bytes = 0
         self._control_output = bytearray()
         self._cancelled_streams: list[int] = []
+        self._ready_requests: list[H2ReadyRequest] = []
         self.last_processed_stream_id = 0
         self.remote_closed = False
         self.local_closed = False
@@ -327,10 +328,13 @@ class H2Protocol:
 
     def initiate(self) -> bytes:
         self.connection.initiate_connection()
-        return self.connection.data_to_send()
+        output = self.connection.data_to_send()
+        if len(output) > self.config.max_control_output_bytes:
+            raise ValueError("HTTP/2 control output exceeds configured maximum")
+        self._validate_wire_output(len(output), 0)
+        return output
 
     def receive_data(self, data: bytes) -> tuple[H2ReadyRequest, ...]:
-        ready: list[H2ReadyRequest] = []
         self._frames.feed(data)
         for wire_chunk in self._frames.take(self.config.reader_frame_batch_size):
             events = self.connection.receive_data(wire_chunk)
@@ -344,7 +348,7 @@ class H2Protocol:
                 elif isinstance(event, self._events["ended"]):
                     completed = self._stream_ended(event.stream_id)
                     if completed is not None:
-                        ready.append(completed)
+                        self._ready_requests.append(completed)
                 elif isinstance(event, self._events["reset"]):
                     self._cancelled_streams.append(event.stream_id)
                     self.drop_stream(event.stream_id)
@@ -357,7 +361,20 @@ class H2Protocol:
                 ):
                     pass
             self._capture_control_output()
-        return tuple(ready)
+        if self._frames.has_ready_frames:
+            return ()
+        cancelled = set(self._cancelled_streams)
+        ready = tuple(
+            item
+            for item in self._ready_requests
+            if item.stream_id not in cancelled
+            and item.stream_id in self._active_streams
+        )
+        self._ready_requests.clear()
+        return ready
+
+    def is_stream_active(self, stream_id: int) -> bool:
+        return stream_id in self._active_streams
 
     def _capture_control_output(self) -> None:
         produced = self.connection.data_to_send()
@@ -369,6 +386,13 @@ class H2Protocol:
         ):
             raise ValueError("HTTP/2 control output exceeds configured maximum")
         self._control_output.extend(produced)
+
+    def _validate_wire_output(self, new_bytes: int, already_buffered: int) -> None:
+        if (
+            new_bytes + already_buffered + self._pending_output_bytes
+            > self.config.max_pending_output_bytes
+        ):
+            raise ValueError("HTTP/2 generated output exceeds configured maximum")
 
     def take_cancelled_streams(self) -> tuple[int, ...]:
         """Return peer-reset stream ids exactly once."""
@@ -536,15 +560,18 @@ class H2Protocol:
         return True
 
     def flush(self) -> bytes:
-        control = bytes(self._control_output)
-        self._control_output.clear()
         commands, self._commands = self._commands, []
         for operation, stream_id, response in commands:
             if operation == "reset":
                 self._reset_stream(stream_id, self._error_codes.ENHANCE_YOUR_CALM)
+                self._capture_control_output()
                 continue
             assert response is not None
             self._start_response(stream_id, response)
+            self._capture_control_output()
+
+        output = bytearray(self._control_output)
+        self._control_output.clear()
 
         for stream_id, outbound in tuple(self._outbound.items()):
             remaining = len(outbound.body) - outbound.offset
@@ -575,10 +602,16 @@ class H2Protocol:
                 continue
             outbound.offset += chunk_size
             self._pending_output_bytes -= chunk_size
+            generated = self.connection.data_to_send()
+            self._validate_wire_output(len(generated), len(output))
+            output.extend(generated)
             if end_stream:
                 self._outbound.pop(stream_id, None)
                 self._active_streams.discard(stream_id)
-        return control + self.connection.data_to_send()
+        generated = self.connection.data_to_send()
+        self._validate_wire_output(len(generated), len(output))
+        output.extend(generated)
+        return bytes(output)
 
     def _start_response(self, stream_id: int, response: Response) -> None:
         headers: list[tuple[str, str]] = [(":status", str(response.status))]
@@ -613,6 +646,9 @@ class H2Protocol:
 
     def drop_stream(self, stream_id: int) -> None:
         self._release_inbound(stream_id)
+        self._ready_requests = [
+            item for item in self._ready_requests if item.stream_id != stream_id
+        ]
         outbound = self._outbound.pop(stream_id, None)
         if outbound is not None:
             self._pending_output_bytes -= len(outbound.body) - outbound.offset
@@ -650,9 +686,17 @@ class H2Protocol:
         self._inbound.clear()
         self._outbound.clear()
         self._commands.clear()
+        self._ready_requests.clear()
         self._active_streams.clear()
         self._buffered_request_bytes = 0
         self._pending_output_bytes = 0
         control = bytes(self._control_output)
         self._control_output.clear()
-        return control + self.connection.data_to_send()
+        generated = self.connection.data_to_send()
+        try:
+            self._validate_wire_output(len(generated), len(control))
+            if len(control) + len(generated) > self.config.max_control_output_bytes:
+                raise ValueError("HTTP/2 control output exceeds configured maximum")
+        except ValueError:
+            return b""
+        return control + generated

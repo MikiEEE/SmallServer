@@ -197,8 +197,8 @@ class HTTP2ProtocolTests(unittest.TestCase):
             max_body_bytes=4,
             max_connection_buffer_bytes=8,
             max_response_body_bytes=4,
-            max_pending_output_bytes=32,
-            max_control_output_bytes=16,
+            max_pending_output_bytes=128,
+            max_control_output_bytes=64,
         )
         client, server = self._pair(config)
         client.send_headers(
@@ -238,6 +238,38 @@ class HTTP2ProtocolTests(unittest.TestCase):
         server.receive_data(client.data_to_send())
         self.assertEqual(server.take_cancelled_streams(), (1,))
         self.assertEqual(server.take_cancelled_streams(), ())
+
+    def test_same_batch_end_then_reset_drops_ready_request_but_keeps_sibling(self):
+        client, server = self._pair(HTTP2Config(reader_frame_batch_size=1))
+        client.send_headers(
+            1,
+            [
+                (":method", "GET"),
+                (":scheme", "http"),
+                (":authority", "localhost"),
+                (":path", "/cancelled"),
+            ],
+            end_stream=True,
+        )
+        client.reset_stream(1)
+        client.send_headers(
+            3,
+            [
+                (":method", "GET"),
+                (":scheme", "http"),
+                (":authority", "localhost"),
+                (":path", "/healthy"),
+            ],
+            end_stream=True,
+        )
+        ready = server.receive_data(client.data_to_send())
+        self.assertEqual(ready, ())
+        while server.has_pending_input:
+            ready = server.receive_data(b"")
+        self.assertEqual([item.stream_id for item in ready], [3])
+        self.assertEqual(server.take_cancelled_streams(), (1,))
+        self.assertFalse(server.is_stream_active(1))
+        self.assertTrue(server.is_stream_active(3))
 
     def test_completed_slow_handler_body_remains_in_connection_budget(self):
         config = HTTP2Config(
@@ -403,9 +435,10 @@ class HTTP2ProtocolTests(unittest.TestCase):
         self.assertEqual(server.pending_output_bytes, 0)
 
         limited_client, limited_server = self._pair(
-            HTTP2Config(max_control_output_bytes=16)
+            HTTP2Config(max_control_output_bytes=52)
         )
-        limited_client.ping(b"12345678")
+        for value in range(4):
+            limited_client.ping(value.to_bytes(8, "big"))
         with self.assertRaisesRegex(ValueError, "control output"):
             limited_server.receive_data(limited_client.data_to_send())
 
@@ -416,6 +449,57 @@ class HTTP2ProtocolTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "compressed header"):
             budget.feed(header)
         self.assertEqual(len(budget._payload), 0)
+
+    def test_response_headers_and_command_resets_obey_output_budget(self):
+        header_client, header_server = self._pair(
+            HTTP2Config(
+                max_pending_output_bytes=64,
+                max_control_output_bytes=64,
+                max_response_body_bytes=1,
+            )
+        )
+        header_client.send_headers(
+            1,
+            [
+                (":method", "GET"),
+                (":scheme", "http"),
+                (":authority", "localhost"),
+                (":path", "/"),
+            ],
+            end_stream=True,
+        )
+        header_server.receive_data(header_client.data_to_send())
+        header_server.flush()
+        header_server.queue_response(
+            1,
+            Response(headers={"x-large": "abcdefghijklmnopqrstuvwxyz" * 8}),
+        )
+        with self.assertRaisesRegex(ValueError, "control output"):
+            header_server.flush()
+
+        reset_client, reset_server = self._pair(
+            HTTP2Config(
+                max_pending_output_bytes=52,
+                max_control_output_bytes=52,
+                max_response_body_bytes=1,
+            )
+        )
+        reset_client.send_headers(
+            1,
+            [
+                (":method", "GET"),
+                (":scheme", "http"),
+                (":authority", "localhost"),
+                (":path", "/"),
+            ],
+            end_stream=True,
+        )
+        for value in range(3):
+            reset_client.ping(value.to_bytes(8, "big"))
+        reset_server.receive_data(reset_client.data_to_send())
+        reset_server.queue_response(1, Response(body=b"xx"))
+        with self.assertRaisesRegex(ValueError, "control output"):
+            reset_server.flush()
 
 
 @unittest.skipUnless(H2_AVAILABLE, "install the smallserver[test] HTTP/2 extra")
@@ -514,11 +598,92 @@ class HTTP2ServerIntegrationTests(unittest.TestCase):
         self.assertTrue(server.finished)
         self.assertIsNone(server.failure)
 
+    def test_same_batch_reset_never_spawns_cancelled_handler(self):
+        runtime = SmallOS().setKernel(Unix())
+        app = SmallServer()
+        called = []
+
+        @app.get("/cancelled")
+        async def cancelled(request):
+            called.append("cancelled")
+            return Response.text("wrong")
+
+        @app.get("/healthy")
+        async def healthy(request):
+            called.append("healthy")
+            return Response.text("ok")
+
+        try:
+            server = app.serve(
+                runtime, host="127.0.0.1", port=0, protocol="http2"
+            )
+        except PermissionError:
+            self.skipTest("the current sandbox does not permit loopback TCP binds")
+        errors = []
+        healthy_body = bytearray()
+
+        def client_work():
+            try:
+                client = H2Connection(config=H2Configuration(client_side=True))
+                client.initiate_connection()
+                with socket.create_connection(
+                    ("127.0.0.1", server.port), timeout=3
+                ) as connection:
+                    connection.sendall(client.data_to_send())
+                    client.send_headers(
+                        1,
+                        [
+                            (":method", "GET"),
+                            (":scheme", "http"),
+                            (":authority", "localhost"),
+                            (":path", "/cancelled"),
+                        ],
+                        end_stream=True,
+                    )
+                    client.reset_stream(1)
+                    client.send_headers(
+                        3,
+                        [
+                            (":method", "GET"),
+                            (":scheme", "http"),
+                            (":authority", "localhost"),
+                            (":path", "/healthy"),
+                        ],
+                        end_stream=True,
+                    )
+                    connection.sendall(client.data_to_send())
+                    ended = False
+                    while not ended:
+                        for event in client.receive_data(connection.recv(65535)):
+                            if isinstance(event, DataReceived) and event.stream_id == 3:
+                                healthy_body.extend(event.data)
+                            elif isinstance(event, StreamEnded) and event.stream_id == 3:
+                                ended = True
+                    server.close()
+                    while connection.recv(65535):
+                        pass
+            except BaseException as exc:
+                errors.append(exc)
+                try:
+                    server.close()
+                except BaseException:
+                    pass
+
+        worker = threading.Thread(target=client_work, daemon=True)
+        worker.start()
+        runtime.start()
+        worker.join(timeout=3)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(called, ["healthy"])
+        self.assertEqual(bytes(healthy_body), b"ok")
+        self.assertEqual(server.owned_connection_count, 0)
+
     def test_large_response_respects_flow_control(self):
         body = b"x" * 100_000
         config = HTTP2Config(
             max_response_body_bytes=len(body),
-            max_pending_output_bytes=len(body),
+            max_pending_output_bytes=len(body) + 64 * 1024,
         )
         client, server = self._pair(config)
         client.send_headers(
