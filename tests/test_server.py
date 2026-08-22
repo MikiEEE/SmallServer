@@ -116,6 +116,9 @@ class HTTPRequestParserTests(unittest.TestCase):
             def resume_task(self, task) -> None:
                 pass
 
+            def cancel_task(self, task) -> None:
+                pass
+
         runtime = Runtime()
         primary = RuntimeError("listen setup failed")
         runtime.kernel.operation_errors["listen"] = primary
@@ -142,6 +145,9 @@ class HTTPRequestParserTests(unittest.TestCase):
                 pass
 
             def resume_task(self, task) -> None:
+                pass
+
+            def cancel_task(self, task) -> None:
                 pass
 
         runtime = Runtime()
@@ -230,6 +236,9 @@ class HTTPRequestParserTests(unittest.TestCase):
                 pass
 
             def resume_task(self, task) -> None:
+                pass
+
+            def cancel_task(self, task) -> None:
                 pass
 
         for interrupt in (KeyboardInterrupt("stop"), SystemExit(7)):

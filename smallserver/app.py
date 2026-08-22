@@ -6,6 +6,11 @@ import inspect
 from collections.abc import Awaitable, Callable, Iterable
 from typing import Any, Literal, NoReturn, Protocol, cast, overload
 
+try:
+    from _thread import allocate_lock
+except ImportError:  # pragma: no cover - runtimes without threads cannot race
+    allocate_lock = None  # type: ignore[assignment]
+
 from ._transport import (
     KernelTransport,
     TransportHandle,
@@ -14,6 +19,7 @@ from ._transport import (
 from .errors import (
     HTTPError,
     ServerConfigurationError,
+    ServerFinalizationError,
     ServerStartupError,
     _CleanupTransaction,
 )
@@ -22,6 +28,14 @@ from .server import HTTPParseError, HTTPRequestParser, ServerConfig, ServerHandl
 
 Handler = Callable[[Request], Awaitable[Response]]
 _METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE"})
+
+
+class _NoThreadLock:
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(self, *args: object) -> None:
+        return None
 
 
 def _raise_startup_cleanup(
@@ -45,6 +59,8 @@ class _RuntimeLike(Protocol):
     def fork(self, children: Any) -> Any: ...
 
     def resume_task(self, task: Any) -> Any: ...
+
+    def cancel_task(self, task: Any) -> Any: ...
 
 
 class _StartableRuntime(_RuntimeLike, Protocol):
@@ -106,6 +122,30 @@ class SmallServer:
     def __init__(self) -> None:
         self._routes: dict[tuple[str, str], Handler] = {}
         self._active_invocation: object | ServerHandle | None = None
+        self._invocation_lock: Any = (
+            allocate_lock() if allocate_lock is not None else _NoThreadLock()
+        )
+
+    def _reserve_invocation(self) -> object:
+        with self._invocation_lock:
+            if self._active_invocation is not None:
+                raise RuntimeError("this SmallServer already has an active listener")
+            marker = object()
+            self._active_invocation = marker
+            return marker
+
+    def _replace_invocation(
+        self, expected: object, replacement: ServerHandle
+    ) -> None:
+        with self._invocation_lock:
+            if self._active_invocation is not expected:
+                raise RuntimeError("SmallServer listener ownership changed unexpectedly")
+            self._active_invocation = replacement
+
+    def _release_invocation(self, expected: object) -> None:
+        with self._invocation_lock:
+            if self._active_invocation is expected:
+                self._active_invocation = None
 
     def route(self, path: str, methods: Iterable[str]) -> Callable[[Handler], Handler]:
         if not isinstance(path, str) or not path.startswith("/"):
@@ -234,6 +274,8 @@ class SmallServer:
             if managed and isinstance(primary_error, KeyboardInterrupt):
                 return handle
             raise primary_error
+        if not handle.finished:
+            raise ServerFinalizationError(self._handle_cleanup_transaction(handle))
         return handle
 
     @staticmethod
@@ -241,7 +283,7 @@ class SmallServer:
         return _HandleCleanupTransaction(handle)
 
     def _validate_runtime(self, runtime: object, *, require_start: bool) -> None:
-        required = ["fork", "resume_task"]
+        required = ["fork", "resume_task", "cancel_task"]
         if require_start:
             required.append("start")
         missing = [name for name in required if not callable(getattr(runtime, name, None))]
@@ -268,14 +310,10 @@ class SmallServer:
             raise ValueError("port must be an integer between 0 and 65535")
         if config is not None and not isinstance(config, ServerConfig):
             raise TypeError("config must be a ServerConfig or None")
-        if self._active_invocation is not None:
-            raise RuntimeError("this SmallServer already has an active listener")
-        marker = object()
-        self._active_invocation = marker
+        marker = self._reserve_invocation()
 
         def release_marker() -> None:
-            if self._active_invocation is marker:
-                self._active_invocation = None
+            self._release_invocation(marker)
 
         def raise_acquisition_cleanup(
             primary_error: BaseException, transaction: _CleanupTransaction
@@ -323,8 +361,7 @@ class SmallServer:
             raise
 
         def release(completed: ServerHandle) -> None:
-            if self._active_invocation is completed:
-                self._active_invocation = None
+            self._release_invocation(completed)
 
         try:
             handle = ServerHandle(
@@ -347,7 +384,7 @@ class SmallServer:
                 raise_acquisition_cleanup(primary_error, transaction)
             release_marker()
             raise
-        self._active_invocation = handle
+        self._replace_invocation(marker, handle)
         tasks: tuple[Any, ...] = ()
         try:
             listener_task = SmallTask(

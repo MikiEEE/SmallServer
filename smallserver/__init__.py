@@ -3,7 +3,12 @@
 from typing import TYPE_CHECKING, Any
 
 from .app import SmallServer
-from .errors import HTTPError, ServerConfigurationError, ServerStartupError
+from .errors import (
+    HTTPError,
+    ServerConfigurationError,
+    ServerFinalizationError,
+    ServerStartupError,
+)
 from .http import Headers, Request, Response
 from .server import ServerConfig, ServerHandle
 
@@ -30,6 +35,7 @@ __all__ = [
     "Response",
     "ServerConfig",
     "ServerConfigurationError",
+    "ServerFinalizationError",
     "ServerHandle",
     "ServerStartupError",
     "SmallServer",
