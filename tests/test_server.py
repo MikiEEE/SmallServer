@@ -1,8 +1,8 @@
 import unittest
 from unittest.mock import patch
 
-from smallserver import SmallServer
-from smallserver.server import HTTPParseError, HTTPRequestParser, ServerConfig
+from smallserver import RouteErrorEvent, SmallServer
+from smallserver.server import HTTPParseError, HTTPRequestParser, RouteObserverChannel, ServerConfig
 
 
 class HTTPRequestParserTests(unittest.TestCase):
@@ -58,6 +58,8 @@ class HTTPRequestParserTests(unittest.TestCase):
             ServerConfig(max_connections=True)
         with self.assertRaisesRegex(ValueError, "max_request_target_bytes"):
             ServerConfig(max_request_target_bytes=0)
+        with self.assertRaisesRegex(ValueError, "max_route_error_events"):
+            ServerConfig(max_route_error_events=0)
 
     def test_config_preserves_legacy_positional_field_mapping(self) -> None:
         config = ServerConfig(1, 2, 3, 4, 5, 6, 7)
@@ -69,6 +71,46 @@ class HTTPRequestParserTests(unittest.TestCase):
         self.assertEqual(config.listener_priority, 6)
         self.assertEqual(config.connection_priority, 7)
         self.assertEqual(config.max_request_target_bytes, 8 * 1024)
+        self.assertEqual(config.max_route_error_events, 16)
+
+    def test_route_observer_channel_has_deterministic_capacity_and_stop(self) -> None:
+        class ObserverTask:
+            @staticmethod
+            def getID() -> int:
+                return 9
+
+        class SourceTask:
+            signals = []
+
+            def sendSignal(self, pid, signal) -> int:
+                self.signals.append((pid, signal))
+                return 0
+
+        channel = RouteObserverChannel(lambda event: None, max_events=1)
+        channel.bind(ObserverTask())
+        source = SourceTask()
+        first = RouteErrorEvent("regex-route-1", "route_match_timeout")
+        second = RouteErrorEvent("regex-route-2", "route_match_timeout")
+        self.assertTrue(channel.enqueue(first, source))
+        self.assertFalse(channel.enqueue(second, source))
+        self.assertEqual(list(channel.events), [first])
+        self.assertEqual(channel.dropped, 1)
+        self.assertEqual(source.signals, [(9, 31)])
+        channel.stop()
+        self.assertFalse(channel.accepting)
+        self.assertEqual(list(channel.events), [])
+        self.assertEqual(channel.dropped, 2)
+
+        failing_channel = RouteObserverChannel(lambda event: None, max_events=1)
+        failing_channel.bind(ObserverTask())
+
+        class FailingSourceTask:
+            def sendSignal(self, pid, signal) -> int:
+                raise RuntimeError("signal failed")
+
+        self.assertFalse(failing_channel.enqueue(first, FailingSourceTask()))
+        self.assertEqual(list(failing_channel.events), [])
+        self.assertEqual(failing_channel.dropped, 1)
 
     def test_serve_closes_bound_socket_when_runtime_fork_fails(self) -> None:
         class Listener:
@@ -105,3 +147,51 @@ class HTTPRequestParserTests(unittest.TestCase):
                 SmallServer().serve(runtime)
         self.assertTrue(listener.closed)
         self.assertEqual(runtime.cancelled, 2)
+
+    def test_observer_task_is_included_in_startup_rollback(self) -> None:
+        class Listener:
+            closed = False
+
+            def setsockopt(self, *args) -> None:
+                pass
+
+            def bind(self, address) -> None:
+                pass
+
+            def listen(self, backlog) -> None:
+                pass
+
+            def setblocking(self, blocking) -> None:
+                pass
+
+            def close(self) -> None:
+                self.closed = True
+
+        class Runtime:
+            tasks = []
+            cancelled = []
+
+            def fork(self, tasks) -> None:
+                self.tasks = list(tasks)
+                raise RuntimeError("no task capacity")
+
+            def cancel_task(self, task) -> None:
+                self.cancelled.append(task)
+
+        listener = Listener()
+        runtime = Runtime()
+        app = SmallServer(route_error_observer=lambda event: None)
+        with patch("smallserver.app.socket.socket", return_value=listener):
+            with self.assertRaisesRegex(RuntimeError, "capacity"):
+                app.serve(runtime)
+        self.assertTrue(listener.closed)
+        self.assertEqual(len(runtime.tasks), 3)
+        self.assertEqual(runtime.cancelled, runtime.tasks)
+        self.assertEqual(
+            [task.name for task in runtime.tasks],
+            [
+                "smallserver-listener",
+                "smallserver-close-watcher",
+                "smallserver-route-observer",
+            ],
+        )
