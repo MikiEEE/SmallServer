@@ -32,7 +32,10 @@ single writer preserves frame ordering and observes peer flow-control windows.
 
 `HTTP2Config` bounds concurrent streams, decoded and compressed header sizes,
 per-stream and per-connection request buffering, response buffering, and frame
-size. Completed request bodies remain charged to the connection budget while
+size. `max_control_output_bytes` bounds generated SETTINGS/PING acknowledgments,
+and `reader_frame_batch_size` forces a cooperative yield during continuously
+readable frame floods. Compressed header-block limits are enforced from the
+frame header before payload buffering. Completed request bodies remain charged to the connection budget while
 their handler is running. `handshake_timeout` bounds receipt of the client
 preface and `idle_timeout` bounds inactive established connections; both use
 SmallOS scheduler timers. Requests and responses use the same immutable
@@ -41,6 +44,9 @@ SmallOS scheduler timers. Requests and responses use the same immutable
 
 Peer stream resets cancel the associated handler task without stopping other
 streams. Protocol/resource violations reset the affected stream when possible.
+An ordinary response-write failure closes only that client connection; a
+kernel close failure remains server-owned, stops acceptance, and is exposed
+through `ServerHandle.failure` and `cleanup_errors` for retry.
 Connection shutdown emits GOAWAY and then releases the connection through the
 SmallOS kernel transport. If a writer is already blocked on kernel
 writability, a lower-priority scheduler task force-closes the stream after the
