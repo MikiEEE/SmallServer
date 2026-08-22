@@ -27,6 +27,9 @@ exits without releasing; the newer commit's CI run owns the release. If the
 version tag already exists, release creation fails visibly and the next release
 pull request must bump `project.version`.
 
+The workflows pin third-party actions to immutable commit revisions. Dependabot
+or a dedicated maintenance pull request should update those pins after review.
+
 ## Local release checks
 
 ```bash
