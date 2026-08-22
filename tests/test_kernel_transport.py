@@ -665,6 +665,9 @@ class KernelTransportTests(unittest.TestCase):
             def resume_task(self, task) -> None:
                 self.resumed.append(task)
 
+            def cancel_task(self, task) -> None:
+                pass
+
         runtime = Runtime()
         handle = SmallServer().serve(runtime, host="0.0.0.0", port=8080)
         self.assertEqual(len(runtime.forked), 1)

@@ -84,9 +84,15 @@ class ServerStartupError(RuntimeError):
         self,
         primary_error: BaseException,
         transaction: _CleanupTransaction,
+        on_cleanup_complete: Callable[[], None] | None = None,
     ) -> None:
         self.primary_error = primary_error
         self._transaction = transaction
+        self._on_cleanup_complete = on_cleanup_complete
+        self._completion_notified = False
+        self._completion_lock: Any = (
+            allocate_lock() if allocate_lock is not None else _NoThreadLock()
+        )
         super().__init__(
             "SmallServer startup failed and resource cleanup is incomplete"
         )
@@ -102,11 +108,24 @@ class ServerStartupError(RuntimeError):
     def retry_cleanup(self) -> bool:
         """Retry every resource still owned by the failed startup."""
         self._transaction.retry()
-        return self._transaction.complete
+        complete = self._transaction.complete
+        if complete:
+            self._notify_cleanup_complete()
+        return complete
 
     def finalize(self) -> bool:
         """Alias for :meth:`retry_cleanup`."""
         return self.retry_cleanup()
+
+    def _notify_cleanup_complete(self) -> None:
+        with self._completion_lock:
+            if self._completion_notified:
+                return
+            self._completion_notified = True
+            callback = self._on_cleanup_complete
+            self._on_cleanup_complete = None
+        if callback is not None:
+            callback()
 
     def __del__(self) -> None:
         try:
@@ -133,3 +152,7 @@ class HTTPError(Exception):
         self.status = status
         self.detail = detail
         super().__init__(detail or "HTTP {}".format(status))
+
+
+class ServerConfigurationError(RuntimeError):
+    """The requested server lifecycle cannot run with the available runtime."""

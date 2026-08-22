@@ -4,14 +4,19 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Awaitable, Callable, Iterable
-from typing import Any, NoReturn
+from typing import Any, Literal, NoReturn, Protocol, overload
 
 from ._transport import (
     KernelTransport,
     TransportHandle,
     _TransportAcquisitionFailure,
 )
-from .errors import HTTPError, ServerStartupError, _CleanupTransaction
+from .errors import (
+    HTTPError,
+    ServerConfigurationError,
+    ServerStartupError,
+    _CleanupTransaction,
+)
 from .http import Request, Response
 from .server import HTTPParseError, HTTPRequestParser, ServerConfig, ServerHandle
 
@@ -20,12 +25,77 @@ _METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE"})
 
 
 def _raise_startup_cleanup(
-    primary_error: BaseException, transaction: _CleanupTransaction
+    primary_error: BaseException,
+    transaction: _CleanupTransaction,
+    on_cleanup_complete: Callable[[], None] | None = None,
 ) -> NoReturn:
-    cleanup_error = ServerStartupError(primary_error, transaction)
+    cleanup_error = ServerStartupError(
+        primary_error, transaction, on_cleanup_complete=on_cleanup_complete
+    )
     if isinstance(primary_error, (KeyboardInterrupt, SystemExit)):
         raise primary_error from cleanup_error
     raise cleanup_error from primary_error
+
+
+class _RuntimeLike(Protocol):
+    """SmallOS lifecycle surface used by one server invocation."""
+
+    kernel: object
+
+    def fork(self, children: Any) -> Any: ...
+
+    def start(self) -> None: ...
+
+    def resume_task(self, task: Any) -> Any: ...
+
+    def cancel_task(self, task: Any) -> Any: ...
+
+
+def _default_runtime_factory() -> _RuntimeLike:
+    """Lazily create the supported desktop runtime for managed ``listen``."""
+    try:
+        from SmallPackage import SmallOS, Unix
+    except (ImportError, AttributeError) as exc:
+        raise ServerConfigurationError(
+            "managed listen() requires SmallOS with the Unix kernel; "
+            "install requirements.txt or supply a configured runtime"
+        ) from exc
+    try:
+        return SmallOS().setKernel(Unix())
+    except Exception as exc:
+        raise ServerConfigurationError(
+            "managed listen() could not create the default SmallOS Unix runtime; "
+            "supply a configured runtime on this platform"
+        ) from exc
+
+
+class _HandleCleanupTransaction(_CleanupTransaction):
+    """Retry one handle finalization attempt while exposing all owned errors."""
+
+    def __init__(self, handle: ServerHandle) -> None:
+        super().__init__()
+        self._handle = handle
+
+        def retry_handle_cleanup() -> None:
+            handle.finalize()
+            if not handle.finished:
+                error = next(
+                    iter(handle.cleanup_errors),
+                    RuntimeError("server finalization cleanup is incomplete"),
+                )
+                raise error
+
+        initial_error = next(
+            iter(handle.cleanup_errors),
+            RuntimeError("server finalization cleanup is incomplete"),
+        )
+        self.add("server", retry_handle_cleanup, initial_error)
+
+    @property
+    def errors(self) -> tuple[BaseException, ...]:
+        if not self._handle.finished and self._handle.cleanup_errors:
+            return self._handle.cleanup_errors
+        return super().errors
 
 
 class SmallServer:
@@ -33,6 +103,7 @@ class SmallServer:
 
     def __init__(self) -> None:
         self._routes: dict[tuple[str, str], Handler] = {}
+        self._active_invocation: object | ServerHandle | None = None
 
     def route(self, path: str, methods: Iterable[str]) -> Callable[[Handler], Handler]:
         if not isinstance(path, str) or not path.startswith("/"):
@@ -72,7 +143,7 @@ class SmallServer:
 
     def serve(
         self,
-        runtime: Any,
+        runtime: _RuntimeLike,
         host: str = "127.0.0.1",
         port: int = 8000,
         config: ServerConfig | None = None,
@@ -84,18 +155,138 @@ class SmallServer:
         kernels use ``await ServerHandle.close_from_task(task)`` on the
         scheduler thread instead.
         """
+        self._validate_runtime(runtime, require_start=False)
+        return self._bind_and_schedule(runtime, host, port, config)
+
+    @overload
+    def listen(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 8000,
+        config: ServerConfig | None = None,
+        *,
+        runtime: None = None,
+        start: Literal[True] | None = None,
+    ) -> ServerHandle: ...
+
+    @overload
+    def listen(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 8000,
+        config: ServerConfig | None = None,
+        *,
+        runtime: _RuntimeLike,
+        start: bool | None = None,
+    ) -> ServerHandle: ...
+
+    def listen(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 8000,
+        config: ServerConfig | None = None,
+        *,
+        runtime: _RuntimeLike | None = None,
+        start: bool | None = None,
+    ) -> ServerHandle:
+        """Bind a server and optionally run its SmallOS scheduler.
+
+        With no runtime, this creates and owns a temporary SmallOS/Unix
+        runtime, blocks until shutdown, and returns the closed handle. With a
+        supplied runtime, scheduling without startup is the default.
+        """
+        if start is not None and type(start) is not bool:
+            raise TypeError("start must be a boolean or None")
+        managed = runtime is None
+        if managed and start is False:
+            raise ValueError("start=False requires a caller-supplied runtime")
+        should_start = managed if start is None else start
+        if runtime is None:
+            runtime = _default_runtime_factory()
+        self._validate_runtime(runtime, require_start=should_start)
+        handle = self._bind_and_schedule(runtime, host, port, config)
+        if not should_start:
+            return handle
+        primary_error: BaseException | None = None
+        try:
+            runtime.start()
+        except BaseException as exc:
+            primary_error = exc
+        finally:
+            handle._finish_close(owner_thread=True)
+        if primary_error is not None:
+            if not handle.finished:
+                transaction = self._handle_cleanup_transaction(handle)
+                _raise_startup_cleanup(primary_error, transaction)
+            if managed and isinstance(primary_error, KeyboardInterrupt):
+                return handle
+            raise primary_error
+        return handle
+
+    @staticmethod
+    def _handle_cleanup_transaction(handle: ServerHandle) -> _CleanupTransaction:
+        return _HandleCleanupTransaction(handle)
+
+    def _validate_runtime(self, runtime: object, *, require_start: bool) -> None:
+        required = ["fork", "resume_task"]
+        if require_start:
+            required.append("start")
+        missing = [name for name in required if not callable(getattr(runtime, name, None))]
+        if missing:
+            raise TypeError(
+                "runtime is missing required operations: {}".format(", ".join(missing))
+            )
+        # Constructing the facade is also the pre-bind kernel capability check.
+        KernelTransport(getattr(runtime, "kernel", None))
+
+    def _bind_and_schedule(
+        self,
+        runtime: _RuntimeLike,
+        host: str,
+        port: int,
+        config: ServerConfig | None,
+    ) -> ServerHandle:
+        """Shared validated bind-and-schedule core for ``serve`` and ``listen``."""
         from SmallPackage import SmallTask
 
         if not isinstance(host, str) or not host:
             raise ValueError("host must be a non-empty string")
-        if not isinstance(port, int) or not 0 <= port <= 65535:
+        if type(port) is not int or not 0 <= port <= 65535:
             raise ValueError("port must be an integer between 0 and 65535")
-        config = config or ServerConfig()
-        transport = KernelTransport(getattr(runtime, "kernel", None))
+        if config is not None and not isinstance(config, ServerConfig):
+            raise TypeError("config must be a ServerConfig or None")
+        if self._active_invocation is not None:
+            raise RuntimeError("this SmallServer already has an active listener")
+        marker = object()
+        self._active_invocation = marker
+
+        def release_marker() -> None:
+            if self._active_invocation is marker:
+                self._active_invocation = None
+
+        def raise_acquisition_cleanup(
+            primary_error: BaseException, transaction: _CleanupTransaction
+        ) -> NoReturn:
+            _raise_startup_cleanup(
+                primary_error,
+                transaction,
+                on_cleanup_complete=release_marker,
+            )
+
+        try:
+            config = config or ServerConfig()
+            transport = KernelTransport(runtime.kernel)
+        except BaseException:
+            release_marker()
+            raise
         try:
             listener = transport.open_listener(host, port, config.max_connections)
         except _TransportAcquisitionFailure as failure:
-            _raise_startup_cleanup(failure.primary_error, failure.transaction)
+            raise_acquisition_cleanup(failure.primary_error, failure.transaction)
+        except BaseException:
+            release_marker()
+            raise
+
         try:
             wakeup = transport.create_wakeup_channel()
         except _TransportAcquisitionFailure as failure:
@@ -105,7 +296,7 @@ class SmallServer:
                 failure.transaction.add(
                     "listener", lambda: transport.close(listener), cleanup_error
                 )
-            _raise_startup_cleanup(failure.primary_error, failure.transaction)
+            raise_acquisition_cleanup(failure.primary_error, failure.transaction)
         except BaseException as primary_error:
             try:
                 transport.close(listener)
@@ -114,9 +305,36 @@ class SmallServer:
                 transaction.add(
                     "listener", lambda: transport.close(listener), cleanup_error
                 )
-                _raise_startup_cleanup(primary_error, transaction)
+                raise_acquisition_cleanup(primary_error, transaction)
+            release_marker()
             raise
-        handle = ServerHandle(runtime, transport, listener, wakeup, config)
+
+        def release(completed: ServerHandle) -> None:
+            if self._active_invocation is completed:
+                self._active_invocation = None
+
+        try:
+            handle = ServerHandle(
+                runtime, transport, listener, wakeup, config, on_finalized=release
+            )
+        except BaseException as primary_error:
+            transaction = _CleanupTransaction()
+            if wakeup is not None:
+                try:
+                    wakeup.close()
+                except BaseException as cleanup_error:
+                    transaction.add("wakeup", wakeup.close, cleanup_error)
+            try:
+                transport.close(listener)
+            except BaseException as cleanup_error:
+                transaction.add(
+                    "listener", lambda: transport.close(listener), cleanup_error
+                )
+            if not transaction.complete:
+                raise_acquisition_cleanup(primary_error, transaction)
+            release_marker()
+            raise
+        self._active_invocation = handle
         tasks: tuple[Any, ...] = ()
         try:
             listener_task = SmallTask(
@@ -127,6 +345,7 @@ class SmallServer:
             )
             tasks = (listener_task,)
             handle._listener_task = listener_task
+            handle._owned_tasks.append(listener_task)
             if wakeup is not None:
                 close_task = SmallTask(
                     config.listener_priority,
@@ -135,65 +354,13 @@ class SmallServer:
                     name="smallserver-close-watcher",
                 )
                 tasks = (listener_task, close_task)
+                handle._close_task = close_task
+                handle._owned_tasks.append(close_task)
             runtime.fork(list(tasks))
         except BaseException as primary_error:
-            task_cleanup_failures = handle._abort_startup(tasks)
-            if task_cleanup_failures or not handle.finished:
-                transaction = _CleanupTransaction()
-                errors = {
-                    name: error for name, error in handle._cleanup_errors.items()
-                }
-                cancel_task = getattr(runtime, "cancel_task", None)
-                for index, (task, cleanup_error) in enumerate(
-                    task_cleanup_failures
-                ):
-
-                    def retry_task_cleanup(task: Any = task) -> None:
-                        if callable(cancel_task):
-                            cancel_task(task)
-                            return
-                        task_cancel = getattr(task, "cancel", None)
-                        if not callable(task_cancel):
-                            raise RuntimeError(
-                                "runtime cannot cancel a startup task"
-                            )
-                        task_cancel()
-
-                    transaction.add(
-                        "task:{}".format(index),
-                        retry_task_cleanup,
-                        cleanup_error,
-                    )
-                if wakeup is not None and not wakeup.closed:
-
-                    def retry_wakeup_cleanup() -> None:
-                        wakeup.close()
-                        handle._cleanup_errors.pop("wakeup", None)
-                        handle._update_finished()
-
-                    transaction.add(
-                        "wakeup",
-                        retry_wakeup_cleanup,
-                        errors.get("wakeup"),
-                    )
-                if not listener.closed:
-
-                    def retry_listener_cleanup() -> None:
-                        transport.close(listener)
-                        handle._cleanup_errors.pop("listener", None)
-                        handle._update_finished()
-
-                    transaction.add(
-                        "listener",
-                        retry_listener_cleanup,
-                        errors.get("listener"),
-                    )
-                if transaction.complete:
-                    transaction.add(
-                        "server",
-                        lambda: handle._finish_close(),
-                        RuntimeError("server startup cleanup is incomplete"),
-                    )
+            handle._abort_startup(tasks)
+            if not handle.finished:
+                transaction = self._handle_cleanup_transaction(handle)
                 _raise_startup_cleanup(primary_error, transaction)
             raise
         return handle
@@ -256,12 +423,15 @@ class SmallServer:
                         name="smallserver-connection",
                     )
                     handle._connections[id(client)] = (client, connection_task)
+                    handle._owned_tasks.append(connection_task)
                     runtime = handle._runtime
                     runtime.fork(connection_task)
                 except BaseException as registration_error:
                     try:
                         if connection_task is not None:
-                            handle._cancel_or_retain_task(connection_task)
+                            if handle._cancel_or_retain_task(connection_task):
+                                if connection_task in handle._owned_tasks:
+                                    handle._owned_tasks.remove(connection_task)
                     finally:
                         handle._connections.pop(id(client), None)
                         handle._close_or_retain(

@@ -1,17 +1,12 @@
-"""Run a SmallOS-backed SmallServer listener and loopback TCP client."""
+"""Run the beginner-facing SmallServer task API on localhost:8000."""
 
 from __future__ import annotations
 
 import json
-import socket
-import threading
-
-from SmallPackage import SmallOS, Unix
 
 from smallserver import HTTPError, Request, Response, SmallServer
 
 
-runtime = SmallOS().setKernel(Unix())
 app = SmallServer()
 tasks: dict[str, dict[str, object]] = {}
 
@@ -86,44 +81,6 @@ async def delete_task(request: Request) -> Response:
     return Response(status=204)
 
 
-def send_request(port: int, method: str, path: str, body: object | None = None) -> bytes:
-    """Send one HTTP/1.1 request to the demo listener and read it to close."""
-    payload = b"" if body is None else json.dumps(body).encode("utf-8")
-    lines = ["{} {} HTTP/1.1".format(method, path), "Host: localhost"]
-    if payload:
-        lines.extend(("Content-Type: application/json", "Content-Length: {}".format(len(payload))))
-    request = ("\r\n".join(lines) + "\r\n\r\n").encode("ascii") + payload
-    with socket.create_connection(("127.0.0.1", port), timeout=2) as client:
-        client.sendall(request)
-        chunks = []
-        while True:
-            chunk = client.recv(4096)
-            if not chunk:
-                return b"".join(chunks)
-            chunks.append(chunk)
-
-
-def run_client(port: int, close_server) -> None:
-    """Exercise every implemented method from outside the SmallOS thread."""
-    try:
-        calls = [
-            ("POST", "/tasks", {"title": "Ship the first SmallServer demo"}),
-            ("GET", "/tasks", None),
-            ("PATCH", "/tasks", {"id": "1", "done": True}),
-            ("PUT", "/tasks", {"tasks": [{"title": "Add socket listener", "done": False}]}),
-            ("DELETE", "/tasks", {"id": "1"}),
-            ("GET", "/missing", None),
-        ]
-        for method, path, body in calls:
-            wire = send_request(port, method, path, body)
-            status_line, _, response_body = wire.partition(b"\r\n\r\n")
-            print("{} {} -> {} {}".format(method, path, status_line.decode(), response_body.decode()))
-    finally:
-        close_server()
-
-
 if __name__ == "__main__":
-    server = app.serve(runtime, host="127.0.0.1", port=0)
-    print("SmallServer listening on http://127.0.0.1:{}".format(server.port))
-    threading.Thread(target=run_client, args=(server.port, server.close), daemon=True).start()
-    runtime.start()
+    print("SmallServer listening on http://127.0.0.1:8000")
+    app.listen(host="127.0.0.1", port=8000)
