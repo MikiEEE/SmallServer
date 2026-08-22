@@ -63,8 +63,9 @@ async def get_user(request):
 ```
 
 Pattern, path, capture, and matching-time limits are configurable with
-`RegexRouteConfig`. A match timeout becomes a sanitized 500 response. An
-optional `route_error_observer` receives only an immutable `RouteErrorEvent`
+`RegexRouteConfig`. On HTTP/1.1 and HTTP/2 listeners, a match timeout becomes a
+sanitized 500 response; direct `dispatch()` raises `RouteMatchTimeout`. An
+optional network-listener `route_error_observer` receives only an immutable `RouteErrorEvent`
 with an opaque route ID and category; it never receives the request target,
 headers, body, traceback, or exception graph.
 

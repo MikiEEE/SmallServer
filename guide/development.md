@@ -34,10 +34,12 @@ without installing the test or HTTP/2 extras:
 python3 -m pip install -r requirements.txt
 python3 -m pip install -e .
 python3 -m unittest tests.test_http2 -v
+python3 -m unittest tests.test_regex_routing -v
 ```
 
-The dependency-contract tests run and HTTP/2 interoperability cases skip
-cleanly; importing and testing HTTP/1.1 must not require hyper-h2.
+The dependency-contract tests run and HTTP/2 interoperability and regex-engine
+cases skip cleanly; importing and testing HTTP/1.1 must require neither
+hyper-h2 nor regex.
 
 Run the examples when their platform requirements are available:
 

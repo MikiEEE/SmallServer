@@ -26,6 +26,7 @@ from SmallPackage import SmallOS, Unix
 from smallserver import (
     HTTP2Config,
     Headers,
+    RegexRouteConfig,
     Request,
     Response,
     RouteErrorEvent,
@@ -601,6 +602,177 @@ class HTTP2ProtocolTests(unittest.TestCase):
 @unittest.skipUnless(H2_AVAILABLE, "install the smallserver[test] HTTP/2 extra")
 class HTTP2ServerIntegrationTests(unittest.TestCase):
     _pair = HTTP2ProtocolTests._pair
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("regex") is not None,
+        "install the smallserver[test] regex extra",
+    )
+    def test_regex_timeout_is_observed_once_without_harming_other_streams(self):
+        runtime = SmallOS().setKernel(Unix())
+        observed = []
+        observer_finished = threading.Event()
+
+        def observe(event):
+            observed.append(event)
+            observer_finished.set()
+            raise RuntimeError("intentional observer failure")
+
+        app = SmallServer(
+            RegexRouteConfig(match_timeout=0.001, total_match_timeout=0.005),
+            route_error_observer=observe,
+        )
+
+        @app.post_regex(r"/(a+)+$")
+        async def expensive(request):
+            return Response.text("must not run")
+
+        @app.get("/healthy")
+        async def healthy(request):
+            return Response.text("healthy")
+
+        try:
+            server = app.serve(
+                runtime, host="127.0.0.1", port=0, protocol="http2"
+            )
+        except PermissionError:
+            self.skipTest("the current sandbox does not permit loopback TCP binds")
+
+        hostile_path = "/" + "a" * 5000 + "!"
+        authorization_secret = "Bearer h2-private-authorization"
+        body_secret = b"h2-private-body"
+        statuses = {}
+        bodies = {1: bytearray(), 3: bytearray(), 5: bytearray()}
+        errors = []
+
+        def client_work():
+            try:
+                client = H2Connection(
+                    config=H2Configuration(
+                        client_side=True, header_encoding="utf-8"
+                    )
+                )
+                client.initiate_connection()
+                with socket.create_connection(
+                    ("127.0.0.1", server.port), timeout=3
+                ) as connection:
+                    connection.sendall(client.data_to_send())
+                    client.send_headers(
+                        1,
+                        [
+                            (":method", "POST"),
+                            (":scheme", "http"),
+                            (":authority", "localhost"),
+                            (":path", hostile_path),
+                            ("authorization", authorization_secret),
+                            ("content-length", str(len(body_secret))),
+                        ],
+                    )
+                    client.send_data(1, body_secret, end_stream=True)
+                    client.send_headers(
+                        3,
+                        [
+                            (":method", "GET"),
+                            (":scheme", "http"),
+                            (":authority", "localhost"),
+                            (":path", "/healthy"),
+                        ],
+                        end_stream=True,
+                    )
+                    connection.sendall(client.data_to_send())
+                    ended = set()
+                    while not {1, 3}.issubset(ended):
+                        data = connection.recv(65535)
+                        if not data:
+                            raise RuntimeError("HTTP/2 connection ended before sibling response")
+                        for event in client.receive_data(data):
+                            if isinstance(event, ResponseReceived):
+                                statuses[event.stream_id] = dict(event.headers)[":status"]
+                            elif isinstance(event, DataReceived):
+                                bodies[event.stream_id].extend(event.data)
+                                client.acknowledge_received_data(
+                                    event.flow_controlled_length, event.stream_id
+                                )
+                            elif isinstance(event, StreamEnded):
+                                ended.add(event.stream_id)
+                        pending = client.data_to_send()
+                        if pending:
+                            connection.sendall(pending)
+
+                    client.send_headers(
+                        5,
+                        [
+                            (":method", "GET"),
+                            (":scheme", "http"),
+                            (":authority", "localhost"),
+                            (":path", "/healthy"),
+                        ],
+                        end_stream=True,
+                    )
+                    connection.sendall(client.data_to_send())
+                    while 5 not in ended:
+                        data = connection.recv(65535)
+                        if not data:
+                            raise RuntimeError("HTTP/2 connection ended before later response")
+                        for event in client.receive_data(data):
+                            if isinstance(event, ResponseReceived):
+                                statuses[event.stream_id] = dict(event.headers)[":status"]
+                            elif isinstance(event, DataReceived):
+                                bodies[event.stream_id].extend(event.data)
+                                client.acknowledge_received_data(
+                                    event.flow_controlled_length, event.stream_id
+                                )
+                            elif isinstance(event, StreamEnded):
+                                ended.add(event.stream_id)
+                        pending = client.data_to_send()
+                        if pending:
+                            connection.sendall(pending)
+
+                    if not observer_finished.wait(2):
+                        raise TimeoutError("route observer did not run")
+                    server.close()
+                    while connection.recv(65535):
+                        pass
+            except BaseException as exc:
+                errors.append(exc)
+                try:
+                    server.close()
+                except BaseException:
+                    pass
+
+        worker = threading.Thread(target=client_work, daemon=True)
+        worker.start()
+        runtime.start()
+        worker.join(timeout=4)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(statuses, {1: "500", 3: "200", 5: "200"})
+        self.assertEqual(bytes(bodies[3]), b"healthy")
+        self.assertEqual(bytes(bodies[5]), b"healthy")
+        self.assertNotIn(hostile_path.encode("ascii"), bytes(bodies[1]))
+        self.assertEqual(
+            observed,
+            [RouteErrorEvent("regex-route-1", "route_match_timeout")],
+        )
+        self.assertEqual(
+            vars(observed[0]),
+            {"route_id": "regex-route-1", "category": "route_match_timeout"},
+        )
+        for secret in (hostile_path, authorization_secret, body_secret.decode("ascii")):
+            self.assertNotIn(secret, repr(observed[0]))
+        self.assertFalse(hasattr(observed[0], "__traceback__"))
+        self.assertEqual(server.route_observer_failures, 1)
+        self.assertEqual(server.dropped_route_error_events, 0)
+        self.assertTrue(server.finished)
+        self.assertIsNone(server.failure)
+        self.assertEqual(server.owned_connection_count, 0)
+        self.assertEqual(runtime.ioReadWaiters, {})
+        self.assertEqual(runtime.ioWriteWaiters, {})
+        channel = server._route_observer_channel
+        self.assertIsNotNone(channel)
+        assert channel is not None
+        self.assertIsNone(channel.task)
+        self.assertEqual(list(channel.events), [])
 
     def test_prior_knowledge_multiplexing_and_graceful_goaway(self):
         runtime = SmallOS().setKernel(Unix())
