@@ -129,12 +129,16 @@ class ServerHandle:
         wakeup: WakeupChannel | None,
         config: ServerConfig,
         on_finalized: Callable[[ServerHandle], None] | None = None,
+        protocol: str = "http1",
+        protocol_config: Any = None,
     ) -> None:
         self._runtime = runtime
         self._transport = transport
         self._listener = listener
         self._wakeup = wakeup
         self._config = config
+        self._protocol = protocol
+        self._protocol_config = protocol_config
         self._address = transport.local_address(listener)
         self._on_finalized = on_finalized
         self._close_requested = False
@@ -152,6 +156,8 @@ class ServerHandle:
         self._closing_connections: dict[int, TransportHandle] = {}
         self._pending_task_cancellations: dict[int, Any] = {}
         self._capacity_waiting = False
+        self._graceful_connections: set[int] = set()
+        self._graceful_closers: dict[int, Callable[[], None]] = {}
 
     @property
     def address(self) -> tuple[str, int]:
@@ -322,10 +328,17 @@ class ServerHandle:
                         self._cancelled_task_ids.add(id(task))
             elif task is not current_task:
                 try:
-                    self._runtime.resume_task(task)
+                    closer = self._graceful_closers.get(identity)
+                    if closer is not None:
+                        closer()
+                    else:
+                        self._runtime.resume_task(task)
                 except BaseException:
                     pass
-            if task is not current_task:
+            if (
+                task is not current_task
+                and not (not owner_thread and identity in self._graceful_connections)
+            ):
                 self._connections.pop(identity, None)
                 self._close_or_retain(connection, current_task)
 
@@ -438,6 +451,8 @@ class ServerHandle:
         """Release a completed connection without losing failed-close ownership."""
         previous_count = self.owned_connection_count
         entry = self._connections.pop(id(connection), None)
+        self._graceful_connections.discard(id(connection))
+        self._graceful_closers.pop(id(connection), None)
         owned_task = entry[1] if entry is not None else task
         if owned_task in self._owned_tasks:
             self._owned_tasks.remove(owned_task)
