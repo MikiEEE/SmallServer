@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 import socket
 from typing import Any
 
 from .http import Headers, Request, Response
+from .routing import RouteErrorEvent
+
+_ROUTE_OBSERVER_SIGNAL = 31
 
 
 class HTTPParseError(Exception):
@@ -127,11 +131,64 @@ class ServerConfig:
     listener_priority: int = 1
     connection_priority: int = 2
     max_request_target_bytes: int = 8 * 1024
+    max_route_error_events: int = 16
 
     def __post_init__(self) -> None:
         for name, value in self.__dict__.items():
             if type(value) is not int or value <= 0:
                 raise ValueError("{} must be a positive integer".format(name))
+
+
+class RouteObserverChannel:
+    """Bounded scheduler-local delivery state for one server invocation."""
+
+    def __init__(self, observer: Any, max_events: int) -> None:
+        self.observer = observer
+        self.max_events = max_events
+        self.events: deque[RouteErrorEvent] = deque()
+        self.task: Any = None
+        self.accepting = True
+        self.dropped = 0
+        self.failures = 0
+
+    def bind(self, task: Any) -> None:
+        self.task = task
+
+    def enqueue(self, event: RouteErrorEvent, source_task: Any) -> bool:
+        if not self.accepting or len(self.events) >= self.max_events:
+            self.dropped += 1
+            return False
+        self.events.append(event)
+        try:
+            signalled = (
+                self.task is not None
+                and source_task.sendSignal(self.task.getID(), _ROUTE_OBSERVER_SIGNAL) == 0
+            )
+        except BaseException:
+            signalled = False
+        if not signalled:
+            self.events.pop()
+            self.dropped += 1
+            return False
+        return True
+
+    def stop(self) -> None:
+        self.accepting = False
+        self.dropped += len(self.events)
+        self.events.clear()
+
+
+async def run_route_observer(task: Any, channel: RouteObserverChannel) -> None:
+    """Drain sanitized events on a dedicated SmallOS task."""
+    while channel.accepting:
+        while channel.events:
+            event = channel.events.popleft()
+            try:
+                channel.observer(event)
+            except BaseException:
+                channel.failures += 1
+        if channel.accepting:
+            await task.wait_signal(_ROUTE_OBSERVER_SIGNAL)
 
 
 class ServerHandle:
@@ -142,12 +199,12 @@ class ServerHandle:
         runtime: Any,
         listener: socket.socket,
         config: ServerConfig,
-        route_observer_dispatcher: Any = None,
+        route_observer_channel: RouteObserverChannel | None = None,
     ) -> None:
         self._runtime = runtime
         self._listener = listener
         self._config = config
-        self._route_observer_dispatcher = route_observer_dispatcher
+        self._route_observer_channel = route_observer_channel
         self._wake_read, self._wake_write = socket.socketpair()
         self._wake_read.setblocking(False)
         self._wake_write.setblocking(False)
@@ -170,13 +227,13 @@ class ServerHandle:
 
     @property
     def dropped_route_error_events(self) -> int:
-        dispatcher = self._route_observer_dispatcher
-        return 0 if dispatcher is None else int(dispatcher.dropped)
+        channel = self._route_observer_channel
+        return 0 if channel is None else int(channel.dropped)
 
     @property
     def route_observer_failures(self) -> int:
-        dispatcher = self._route_observer_dispatcher
-        return 0 if dispatcher is None else int(dispatcher.failures)
+        channel = self._route_observer_channel
+        return 0 if channel is None else int(channel.failures)
 
     def close(self) -> None:
         """Request shutdown safely from any thread without closing live FDs there."""
@@ -194,6 +251,12 @@ class ServerHandle:
         self._connections.clear()
         if self._listener_task is not None:
             self._runtime.resume_task(self._listener_task)
+        channel = self._route_observer_channel
+        if channel is not None:
+            channel.stop()
+            if channel.task is not None:
+                self._runtime.cancel_task(channel.task)
+                channel.task = None
         for sock in (self._listener, self._wake_read, self._wake_write):
             try:
                 sock.close()
@@ -203,6 +266,9 @@ class ServerHandle:
     def _abort_startup(self, tasks: tuple[Any, ...]) -> None:
         """Release bound resources after task registration fails."""
         self._closed = True
+        channel = self._route_observer_channel
+        if channel is not None:
+            channel.stop()
         cancel_task = getattr(self._runtime, "cancel_task", None)
         if callable(cancel_task):
             for task in tasks:
@@ -210,6 +276,8 @@ class ServerHandle:
                     cancel_task(task)
                 except BaseException:
                     pass
+        if channel is not None:
+            channel.task = None
         for sock in (self._listener, self._wake_read, self._wake_write):
             try:
                 sock.close()

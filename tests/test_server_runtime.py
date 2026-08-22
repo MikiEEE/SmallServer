@@ -4,7 +4,6 @@ import inspect
 import socket
 import threading
 import unittest
-from unittest.mock import patch
 
 from SmallPackage import SmallOS, Unix
 from SmallPackage.adapters.threads import ThreadAdapter
@@ -18,6 +17,7 @@ from smallserver import (
     RouteMatchTimeout,
     SmallServer,
 )
+from smallserver.server import run_route_observer
 
 
 HAS_REGEX = importlib.util.find_spec("regex") is not None
@@ -186,23 +186,21 @@ class SmallOSServerIntegrationTests(unittest.TestCase):
         observed: list[RouteErrorEvent] = []
         observer_graph = []
         observer_finished = threading.Event()
-        hook_finished = threading.Event()
-        hook_events = []
+        observer_threads = []
 
         def observe(event: RouteErrorEvent) -> None:
             observed.append(event)
+            observer_threads.append(threading.current_thread())
             caller_locals = []
             frame = inspect.currentframe()
             while frame is not None:
                 caller_locals.append(dict(frame.f_locals))
+                if frame.f_code is run_route_observer.__code__:
+                    break
                 frame = frame.f_back
-            observer_graph.extend(_reachable_objects(caller_locals))
+            observer_graph.extend(_reachable_container_values(caller_locals))
             observer_finished.set()
             raise RuntimeError("intentional observer failure")
-
-        def observe_thread_failure(arguments) -> None:
-            hook_events.append(arguments)
-            hook_finished.set()
 
         app = SmallServer(
             RegexRouteConfig(match_timeout=0.001, total_match_timeout=0.005),
@@ -227,35 +225,24 @@ class SmallOSServerIntegrationTests(unittest.TestCase):
         hostile_path = "/" + "a" * 5000 + "!"
         authorization_secret = "Bearer sensitive-authorization-marker"
         body_secret = b"sensitive-body-marker"
-        received = []
-        errors = []
-
-        def client() -> None:
-            try:
-                request = (
-                    "POST {} HTTP/1.1\r\n"
-                    "Host: localhost\r\n"
-                    "Authorization: {}\r\n"
-                    "Content-Length: {}\r\n\r\n"
-                ).format(hostile_path, authorization_secret, len(body_secret)).encode("ascii")
-                received.append(self._exchange(server.port, request + body_secret))
-                received.append(self._request(server.port, "/health"))
-                if not observer_finished.wait(2):
-                    raise TimeoutError("route observer did not run")
-                if not hook_finished.wait(2):
-                    raise TimeoutError("observer failure was not reported")
-            except BaseException as exc:
-                errors.append(exc)
-            finally:
-                server.close()
-
-        worker = threading.Thread(target=client, daemon=True)
-        with patch("threading.excepthook", side_effect=observe_thread_failure):
-            worker.start()
-            runtime.start()
-            worker.join(timeout=3)
-        self.assertFalse(worker.is_alive())
-        self.assertEqual(errors, [])
+        runtime_thread = threading.Thread(
+            target=runtime.start,
+            name="smallos-runtime-test",
+            daemon=True,
+        )
+        runtime_thread.start()
+        request = (
+            "POST {} HTTP/1.1\r\n"
+            "Host: localhost\r\n"
+            "Authorization: {}\r\n"
+            "Content-Length: {}\r\n\r\n"
+        ).format(hostile_path, authorization_secret, len(body_secret)).encode("ascii")
+        received = [self._exchange(server.port, request + body_secret)]
+        received.append(self._request(server.port, "/health"))
+        self.assertTrue(observer_finished.wait(2), "route observer did not run")
+        server.close()
+        runtime_thread.join(timeout=3)
+        self.assertFalse(runtime_thread.is_alive())
         self.assertEqual(len(observed), 1)
         event = observed[0]
         self.assertEqual(event.route_id, "regex-route-1")
@@ -284,8 +271,17 @@ class SmallOSServerIntegrationTests(unittest.TestCase):
         self.assertNotIn(body_secret, observer_graph)
         self.assertEqual(server.route_observer_failures, 1)
         self.assertEqual(server.dropped_route_error_events, 0)
-        self.assertEqual(len(hook_events), 1)
-        self.assertIsInstance(hook_events[0].exc_value, RuntimeError)
+        self.assertEqual(observer_threads, [runtime_thread])
+        self.assertNotIn(
+            "smallserver-route-observer",
+            {thread.name for thread in threading.enumerate()},
+        )
+        channel = server._route_observer_channel
+        self.assertIsNotNone(channel)
+        assert channel is not None
+        self.assertFalse(channel.accepting)
+        self.assertEqual(list(channel.events), [])
+        self.assertIsNone(channel.task)
         self.assertTrue(received[0].startswith(b"HTTP/1.1 500 Internal Server Error\r\n"))
         self.assertNotIn(hostile_path.encode("ascii"), received[0])
         self.assertTrue(received[1].startswith(b"HTTP/1.1 200 OK\r\n"))
@@ -344,4 +340,24 @@ def _reachable_objects(root):
             pending.extend(value)
         elif hasattr(value, "__dict__"):
             pending.append(vars(value))
+    return result
+
+
+def _reachable_container_values(root):
+    """Walk frame-local containers without traversing scheduler object graphs."""
+    pending = [root]
+    seen = set()
+    result = []
+    while pending:
+        value = pending.pop()
+        identity = id(value)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        result.append(value)
+        if isinstance(value, dict):
+            pending.extend(value.keys())
+            pending.extend(value.values())
+        elif isinstance(value, (tuple, list, set, frozenset)):
+            pending.extend(value)
     return result
