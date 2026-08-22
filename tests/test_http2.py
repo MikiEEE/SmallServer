@@ -57,6 +57,9 @@ class HTTP2OptionalDependencyTests(unittest.TestCase):
             {"handshake_timeout": 0},
             {"idle_timeout": -1},
             {"idle_timeout": True},
+            {"handshake_timeout": float("nan")},
+            {"handshake_timeout": float("inf")},
+            {"idle_timeout": float("-inf")},
         ):
             with self.subTest(values=values):
                 with self.assertRaises(ValueError):

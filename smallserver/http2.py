@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Any
 
 from .errors import ServerConfigurationError
@@ -39,7 +40,12 @@ class HTTP2Config:
                 raise ValueError("{} must be a positive integer".format(name))
         for name in ("handshake_timeout", "idle_timeout"):
             value = getattr(self, name)
-            if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
+            if (
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not math.isfinite(value)
+                or value <= 0
+            ):
                 raise ValueError("{} must be a positive number".format(name))
         if not 16_384 <= self.max_frame_size <= 16_777_215:
             raise ValueError("max_frame_size must be between 16384 and 16777215")
