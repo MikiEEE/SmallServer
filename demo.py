@@ -82,5 +82,5 @@ async def delete_task(request: Request) -> Response:
 
 
 if __name__ == "__main__":
-    print("SmallServer listening on http://127.0.0.1:8000")
+    print("Starting SmallServer on http://127.0.0.1:8000")
     app.listen(host="127.0.0.1", port=8000)

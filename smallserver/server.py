@@ -302,8 +302,9 @@ class ServerHandle:
                 )
                 self._cleanup_errors["connection:{}".format(identity)] = error
 
-        retried_task_ids = set(self._pending_task_cancellations)
+        attempted_task_ids: set[int] = set()
         for identity, task in list(self._pending_task_cancellations.items()):
+            attempted_task_ids.add(identity)
             if self._cancel_or_retain_task(task):
                 self._pending_task_cancellations.pop(identity, None)
                 self._cleanup_errors.pop("task:{}".format(identity), None)
@@ -314,8 +315,9 @@ class ServerHandle:
                 if (
                     task is not current_task
                     and id(task) not in self._cancelled_task_ids
-                    and id(task) not in retried_task_ids
+                    and id(task) not in attempted_task_ids
                 ):
+                    attempted_task_ids.add(id(task))
                     if self._cancel_or_retain_task(task):
                         self._cancelled_task_ids.add(id(task))
             elif task is not current_task:
@@ -332,9 +334,10 @@ class ServerHandle:
                 if (
                     task is current_task
                     or id(task) in self._cancelled_task_ids
-                    or id(task) in retried_task_ids
+                    or id(task) in attempted_task_ids
                 ):
                     continue
+                attempted_task_ids.add(id(task))
                 if self._cancel_or_retain_task(task):
                     self._cancelled_task_ids.add(id(task))
             # Owner-thread finalization has cancelled the listener task; it
@@ -415,13 +418,9 @@ class ServerHandle:
         identity = id(task)
         cancel_task = getattr(self._runtime, "cancel_task", None)
         try:
-            if callable(cancel_task):
-                cancel_task(task)
-            else:
-                task_cancel = getattr(task, "cancel", None)
-                if not callable(task_cancel):
-                    raise RuntimeError("runtime cannot cancel a connection task")
-                task_cancel()
+            if not callable(cancel_task):
+                raise RuntimeError("runtime cannot unregister a server task")
+            cancel_task(task)
         except BaseException as exc:
             self._pending_task_cancellations[identity] = task
             self._cleanup_errors["task:{}".format(identity)] = exc

@@ -696,6 +696,9 @@ class KernelTransportTests(unittest.TestCase):
             def resume_task(self, task) -> None:
                 self.resumed.append(task)
 
+            def cancel_task(self, task) -> None:
+                pass
+
         runtime = MicroRuntime()
         app = SmallServer()
 

@@ -72,30 +72,24 @@ class _CleanupTransaction:
             return not self._actions
 
 
-class ServerStartupError(RuntimeError):
-    """Startup failed while framework-owned resources still need cleanup.
-
-    The exception retains ownership without exposing kernel handles. Call
-    :meth:`retry_cleanup` until it returns ``True``; successful cleanup is
-    idempotent.
-    """
+class _ServerCleanupError(RuntimeError):
+    """Framework-owned cleanup transaction exposed for explicit retry."""
 
     def __init__(
         self,
-        primary_error: BaseException,
         transaction: _CleanupTransaction,
+        message: str,
+        warning_message: str,
         on_cleanup_complete: Callable[[], None] | None = None,
     ) -> None:
-        self.primary_error = primary_error
         self._transaction = transaction
+        self._warning_message = warning_message
         self._on_cleanup_complete = on_cleanup_complete
         self._completion_notified = False
         self._completion_lock: Any = (
             allocate_lock() if allocate_lock is not None else _NoThreadLock()
         )
-        super().__init__(
-            "SmallServer startup failed and resource cleanup is incomplete"
-        )
+        super().__init__(message)
 
     @property
     def cleanup_errors(self) -> tuple[BaseException, ...]:
@@ -106,7 +100,7 @@ class ServerStartupError(RuntimeError):
         return self._transaction.complete
 
     def retry_cleanup(self) -> bool:
-        """Retry every resource still owned by the failed startup."""
+        """Retry every resource still owned by the failed lifecycle operation."""
         self._transaction.retry()
         complete = self._transaction.complete
         if complete:
@@ -134,13 +128,47 @@ class ServerStartupError(RuntimeError):
             import warnings
 
             warnings.warn(
-                "abandoned ServerStartupError still owns resources after cleanup retry",
+                self._warning_message,
                 ResourceWarning,
                 stacklevel=2,
             )
         except BaseException:
             # Destructors must never interfere with interpreter shutdown.
             return
+
+
+class ServerStartupError(_ServerCleanupError):
+    """Startup failed while framework-owned resources still need cleanup."""
+
+    def __init__(
+        self,
+        primary_error: BaseException,
+        transaction: _CleanupTransaction,
+        on_cleanup_complete: Callable[[], None] | None = None,
+    ) -> None:
+        self.primary_error = primary_error
+        super().__init__(
+            transaction,
+            "SmallServer startup failed and resource cleanup is incomplete",
+            "abandoned ServerStartupError still owns resources after cleanup retry",
+            on_cleanup_complete,
+        )
+
+
+class ServerFinalizationError(_ServerCleanupError):
+    """Runtime exit left framework-owned resources requiring cleanup retry."""
+
+    def __init__(
+        self,
+        transaction: _CleanupTransaction,
+        on_cleanup_complete: Callable[[], None] | None = None,
+    ) -> None:
+        super().__init__(
+            transaction,
+            "SmallServer runtime exited but resource cleanup is incomplete",
+            "abandoned ServerFinalizationError still owns resources after cleanup retry",
+            on_cleanup_complete,
+        )
 
 
 class HTTPError(Exception):

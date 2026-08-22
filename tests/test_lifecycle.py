@@ -2,14 +2,22 @@ from __future__ import annotations
 
 import ast
 from contextlib import nullcontext
+import gc
 import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
 import unittest
+import warnings
 from unittest.mock import patch
 
-from smallserver import ServerConfigurationError, ServerStartupError, SmallServer
+from smallserver import (
+    ServerConfigurationError,
+    ServerFinalizationError,
+    ServerStartupError,
+    SmallServer,
+)
 from smallserver._transport import TransportHandle
 from smallserver.server import ServerHandle
 
@@ -67,6 +75,9 @@ class ServerLifecycleTests(unittest.TestCase):
             }:
                 forbidden.append(node.module)
         self.assertEqual(forbidden, [])
+        demo_source = demo_path.read_text(encoding="utf-8")
+        self.assertIn('print("Starting SmallServer', demo_source)
+        self.assertNotIn('print("SmallServer listening', demo_source)
 
         import demo
 
@@ -146,18 +157,43 @@ class ServerLifecycleTests(unittest.TestCase):
         next_handle = app.serve(FakeRuntime(), port=0)
         next_handle.finalize()
 
-    def test_normal_runtime_return_exposes_unfinished_handle_for_retry(self) -> None:
+    def test_managed_normal_return_exposes_cleanup_owner_for_retry(self) -> None:
         runtime = FakeRuntime()
         runtime.kernel.close_failures[id(runtime.kernel.listener)] = 1
         app = SmallServer()
 
-        handle = app.listen(runtime=runtime, start=True, port=0)
+        with patch("smallserver.app._default_runtime_factory", return_value=runtime):
+            with self.assertRaises(ServerFinalizationError) as raised:
+                app.listen(port=0)
 
-        self.assertFalse(handle.finished)
+        cleanup = raised.exception
+        self.assertFalse(cleanup.cleanup_complete)
         with self.assertRaisesRegex(RuntimeError, "active listener"):
             app.serve(FakeRuntime(), port=0)
-        handle.finalize()
-        self.assertTrue(handle.finished)
+        self.assertTrue(cleanup.retry_cleanup())
+        next_handle = app.serve(FakeRuntime(), port=0)
+        next_handle.finalize()
+
+    def test_abandoned_finalization_error_warns_and_retains_cleanup(self) -> None:
+        runtime = FakeRuntime()
+        runtime.kernel.close_failures[id(runtime.kernel.listener)] = 3
+        app = SmallServer()
+
+        with patch("smallserver.app._default_runtime_factory", return_value=runtime):
+            with self.assertRaises(ServerFinalizationError) as raised:
+                app.listen(port=0)
+
+        transaction = raised.exception._transaction
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", ResourceWarning)
+            raised.exception = None
+            gc.collect()
+
+        self.assertEqual(len(caught), 1)
+        self.assertIs(caught[0].category, ResourceWarning)
+        self.assertIn("ServerFinalizationError", str(caught[0].message))
+        self.assertEqual(len(transaction.retry()), 1)
+        self.assertEqual(len(transaction.retry()), 0)
         next_handle = app.serve(FakeRuntime(), port=0)
         next_handle.finalize()
 
@@ -229,6 +265,74 @@ class ServerLifecycleTests(unittest.TestCase):
 
         with self.assertRaisesRegex(TypeError, "boolean"):
             SmallServer().listen(runtime=FakeRuntime(), start=1)  # type: ignore[arg-type]
+
+    def test_runtime_without_cancel_is_rejected_without_registry_growth(self) -> None:
+        from SmallPackage import SmallOS
+
+        class RuntimeWithoutCancellation:
+            def __init__(self) -> None:
+                self.inner = SmallOS()
+                self.kernel = FakeKernel()
+
+            def fork(self, children) -> object:
+                return self.inner.fork(children)
+
+            def resume_task(self, task) -> object:
+                return self.inner.resume_task(task)
+
+        runtime = RuntimeWithoutCancellation()
+        before = len(runtime.inner.tasks)
+
+        with self.assertRaisesRegex(TypeError, "cancel_task"):
+            SmallServer().serve(runtime, port=0)  # type: ignore[arg-type]
+
+        self.assertEqual(len(runtime.inner.tasks), before)
+        self.assertEqual(runtime.kernel.calls, [])
+
+    def test_simultaneous_invocations_reserve_once_and_bind_once(self) -> None:
+        gate = threading.Barrier(2)
+        bind_calls: list[object] = []
+        bind_lock = threading.Lock()
+
+        class RacingKernel(FakeKernel):
+            def __init__(self) -> None:
+                super().__init__()
+                self._first_capability_check = True
+
+            def supports_tcp_server(self) -> bool:
+                result = super().supports_tcp_server()
+                if self._first_capability_check:
+                    self._first_capability_check = False
+                    gate.wait(timeout=2)
+                return result
+
+            def socket_bind(self, stream: object, address: object) -> None:
+                with bind_lock:
+                    bind_calls.append(stream)
+                super().socket_bind(stream, address)
+
+        app = SmallServer()
+        handles: list[ServerHandle] = []
+        errors: list[BaseException] = []
+
+        def invoke() -> None:
+            try:
+                handles.append(app.serve(FakeRuntime(RacingKernel()), port=0))
+            except BaseException as exc:
+                errors.append(exc)
+
+        workers = [threading.Thread(target=invoke) for _ in range(2)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=3)
+
+        self.assertTrue(all(not worker.is_alive() for worker in workers))
+        self.assertEqual(len(handles), 1)
+        self.assertEqual(len(bind_calls), 1)
+        self.assertEqual(len(errors), 1)
+        self.assertRegex(str(errors[0]), "active listener")
+        handles[0].finalize()
 
     def test_acquisition_cleanup_retains_invocation_until_retry(self) -> None:
         runtime = FakeRuntime()
@@ -342,6 +446,40 @@ class ServerLifecycleTests(unittest.TestCase):
             ["live-client", "listener"],
         )
         self.assertEqual(runtime.cancelled.count(client_task), 1)
+
+    def test_connection_task_cancellation_is_attempted_once_per_finalize(self) -> None:
+        class RetryCancellationRuntime(FakeRuntime):
+            def __init__(self) -> None:
+                super().__init__()
+                self.attempts: dict[int, int] = {}
+
+            def cancel_task(self, task) -> int:
+                identity = id(task)
+                self.attempts[identity] = self.attempts.get(identity, 0) + 1
+                if (
+                    getattr(task, "fail_first_cancel", False)
+                    and self.attempts[identity] == 1
+                ):
+                    raise RuntimeError("cancel failed")
+                return super().cancel_task(task)
+
+        class ConnectionTask:
+            fail_first_cancel = True
+
+        runtime = RetryCancellationRuntime()
+        handle = SmallServer().serve(runtime, port=0)
+        client = TransportHandle(OpaqueHandle("retry-client"))
+        connection_task = ConnectionTask()
+        handle._connections[id(client)] = (client, connection_task)
+        handle._owned_tasks.append(connection_task)
+
+        handle.finalize()
+
+        self.assertEqual(runtime.attempts[id(connection_task)], 1)
+        self.assertFalse(handle.finished)
+        handle.finalize()
+        self.assertEqual(runtime.attempts[id(connection_task)], 2)
+        self.assertTrue(handle.finished)
 
     def test_default_runtime_configuration_failure_is_framework_owned(self) -> None:
         with patch.dict(sys.modules, {"SmallPackage": None}):
