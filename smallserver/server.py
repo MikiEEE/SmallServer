@@ -317,6 +317,7 @@ class ServerHandle:
                 self._cancelled_task_ids.add(identity)
 
         for identity, (connection, task) in list(self._connections.items()):
+            graceful_requested = False
             if owner_thread:
                 if (
                     task is not current_task
@@ -327,17 +328,24 @@ class ServerHandle:
                     if self._cancel_or_retain_task(task):
                         self._cancelled_task_ids.add(id(task))
             elif task is not current_task:
-                try:
-                    closer = self._graceful_closers.get(identity)
-                    if closer is not None:
+                closer = self._graceful_closers.get(identity)
+                if closer is not None:
+                    try:
                         closer()
-                    else:
+                        graceful_requested = True
+                    except BaseException:
+                        try:
+                            self._runtime.resume_task(task)
+                        except BaseException:
+                            pass
+                else:
+                    try:
                         self._runtime.resume_task(task)
-                except BaseException:
-                    pass
+                    except BaseException:
+                        pass
             if (
                 task is not current_task
-                and not (not owner_thread and identity in self._graceful_connections)
+                and not (not owner_thread and graceful_requested)
             ):
                 self._connections.pop(identity, None)
                 self._close_or_retain(connection, current_task)
