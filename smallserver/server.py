@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import socket
 from typing import Any
 
+from ._transport import KernelTransport, WakeupChannelLike
 from .http import Headers, Request, Response
 
 
@@ -118,21 +118,27 @@ class ServerConfig:
 class ServerHandle:
     """A bound listener and its cooperative shutdown signal."""
 
-    def __init__(self, runtime: Any, listener: socket.socket, config: ServerConfig) -> None:
+    def __init__(
+        self,
+        runtime: Any,
+        transport: KernelTransport,
+        listener: object,
+        wakeup: WakeupChannelLike,
+        config: ServerConfig,
+    ) -> None:
         self._runtime = runtime
+        self._transport = transport
         self._listener = listener
+        self._wakeup = wakeup
         self._config = config
-        self._wake_read, self._wake_write = socket.socketpair()
-        self._wake_read.setblocking(False)
-        self._wake_write.setblocking(False)
         self._closed = False
+        self._finished = False
         self._listener_task: Any = None
-        self._connections: dict[socket.socket, Any] = {}
+        self._connections: dict[int, tuple[object, Any]] = {}
 
     @property
     def address(self) -> tuple[str, int]:
-        host, port = self._listener.getsockname()[:2]
-        return str(host), int(port)
+        return self._transport.local_address(self._listener)
 
     @property
     def port(self) -> int:
@@ -148,21 +154,31 @@ class ServerHandle:
             return
         self._closed = True
         try:
-            self._wake_write.send(b"x")
-        except (BlockingIOError, OSError):
+            self._wakeup.notify()
+        except Exception:
             pass
 
     def _finish_close(self) -> None:
-        for task in list(self._connections.values()):
-            self._runtime.resume_task(task)
+        if self._finished:
+            return
+        self._finished = True
+        for connection, task in list(self._connections.values()):
+            try:
+                self._runtime.resume_task(task)
+            except Exception:
+                pass
+            self._transport.close_safely(connection)
         self._connections.clear()
         if self._listener_task is not None:
-            self._runtime.resume_task(self._listener_task)
-        for sock in (self._listener, self._wake_read, self._wake_write):
             try:
-                sock.close()
-            except OSError:
+                self._runtime.resume_task(self._listener_task)
+            except Exception:
                 pass
+        self._transport.close_safely(self._listener)
+        try:
+            self._wakeup.close()
+        except Exception:
+            pass
 
     def _abort_startup(self, tasks: tuple[Any, ...]) -> None:
         """Release bound resources after task registration fails."""
@@ -174,16 +190,4 @@ class ServerHandle:
                     cancel_task(task)
                 except BaseException:
                     pass
-        for sock in (self._listener, self._wake_read, self._wake_write):
-            try:
-                sock.close()
-            except OSError:
-                pass
-
-
-async def _wait_readable(task: Any, sock: socket.socket) -> None:
-    await task.wait_readable(sock)
-
-
-async def _wait_writable(task: Any, sock: socket.socket) -> None:
-    await task.wait_writable(sock)
+        self._finish_close()
