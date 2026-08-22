@@ -67,6 +67,8 @@ class SmallOSServerIntegrationTests(unittest.TestCase):
         self.assertEqual(runtime.ioWriteWaiters, {})
         self.assertIsNone(runtime._io_wait_set)
         self.assertTrue(server._listener.closed)
+        self.assertIsNone(server.failure)
+        self.assertIsNone(server._listener_task.exception)
 
     def test_blocking_adapter_does_not_block_unrelated_connection(self) -> None:
         runtime = SmallOS().setKernel(Unix())
