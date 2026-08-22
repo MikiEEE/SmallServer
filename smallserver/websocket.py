@@ -19,6 +19,9 @@ _DECISION_SIGNAL = 24
 _INBOX_SIGNAL = 25
 _OUTBOX_SIGNAL = 26
 _ACK_SIGNAL = 27
+_HTTP_TOKEN_CHARACTERS = frozenset(
+    "!#$%&'*+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+)
 
 
 class WebSocketUnavailable(RuntimeError):
@@ -85,6 +88,7 @@ class WebSocketConfig:
     handshake_timeout: float = 10.0
     idle_timeout: float = 300.0
     pong_timeout: float = 10.0
+    write_timeout: float = 30.0
     close_timeout: float = 5.0
     deadline_resolution: float = 0.05
 
@@ -108,6 +112,7 @@ class WebSocketConfig:
             "handshake_timeout",
             "idle_timeout",
             "pong_timeout",
+            "write_timeout",
             "close_timeout",
             "deadline_resolution",
         ):
@@ -328,25 +333,33 @@ class _WebSocketState:
         self.deadline_task: Any = None
         self.accepted = False
         self.rejected = False
+        self.handshake_state = "pending"
+        self.handshake_error: BaseException | None = None
         self.shutdown = False
         self.peer_closed = False
         self.close_sent = False
         self.subprotocol: str | None = None
         self.disconnect: WebSocketDisconnect | None = None
         self.handler_error: BaseException | None = None
+        self.fatal_error: BaseException | None = None
         self.inbox: deque[WebSocketMessage] = deque()
         self.inbox_bytes = 0
         self.outbox: deque[_OutboundCommand] = deque()
         self.outbox_bytes = 0
         self.writer_busy = False
+        self.active_command: _OutboundCommand | None = None
         self._message_kind: type | None = None
-        self._message_parts: list[str] | list[bytes] = []
+        self._message_buffer = bytearray()
         self._message_bytes = 0
         self._guard = _FrameGuard(config.max_frame_payload_bytes)
         self.created_at = time.monotonic()
         self.last_activity = self.created_at
         self.pong_deadline: float | None = None
+        self._ping_generation = 0
+        self._pending_ping_generation: int | None = None
+        self._pending_ping_payload: bytes | None = None
         self.close_deadline: float | None = None
+        self.write_deadline: float | None = None
         self._children: list[Any] = []
 
     def _current_task(self) -> Any:
@@ -376,7 +389,7 @@ class _WebSocketState:
         self, subprotocol: str | None, headers: Mapping[str, str] | None
     ) -> None:
         task = self._current_task()
-        if self.accepted or self.rejected:
+        if self.handshake_state != "pending":
             raise WebSocketStateError("WebSocket handshake is already decided")
         if subprotocol is not None:
             if subprotocol not in self.route.subprotocols:
@@ -389,6 +402,7 @@ class _WebSocketState:
             "upgrade",
             "sec-websocket-accept",
             "sec-websocket-protocol",
+            "sec-websocket-extensions",
             "content-length",
         }
         if any(name.lower() in forbidden for name in extra):
@@ -405,24 +419,55 @@ class _WebSocketState:
             lines.append("Sec-WebSocket-Protocol: {}".format(subprotocol))
         lines.extend("{}: {}".format(name, value) for name, value in extra.items())
         payload = ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1")
-        self.protocol = self.api.Connection(self.api.ConnectionType.SERVER)
-        await self.transport.send_all(task, self.client, payload)
-        self.subprotocol = subprotocol
-        self.accepted = True
-        self.last_activity = time.monotonic()
-        self._signal(self.coordinator_task, _DECISION_SIGNAL)
+        protocol = self.api.Connection(self.api.ConnectionType.SERVER)
+        self.handshake_state = "accepting"
+        self.protocol = protocol
+        try:
+            await self.transport.send_all(task, self.client, payload)
+        except GeneratorExit:
+            raise
+        except BaseException as exc:
+            self._fail_handshake(exc)
+            raise
+        else:
+            self.subprotocol = subprotocol
+            self.accepted = True
+            self.handshake_state = "accepted"
+            self.last_activity = time.monotonic()
+            self._signal(self.coordinator_task, _DECISION_SIGNAL)
 
     async def reject(self, response: Response) -> None:
         task = self._current_task()
-        if self.accepted or self.rejected:
+        if self.handshake_state != "pending":
             raise WebSocketStateError("WebSocket handshake is already decided")
         if not isinstance(response, Response):
             raise TypeError("reject() requires a Response")
         if response.status < 300:
             raise ValueError("WebSocket rejection response must have status 300 or greater")
-        await self._send_http(task, response)
-        self.rejected = True
-        self._signal(self.coordinator_task, _DECISION_SIGNAL)
+        self.handshake_state = "rejecting"
+        try:
+            await self._send_http(task, response)
+        except GeneratorExit:
+            raise
+        except BaseException as exc:
+            self._fail_handshake(exc)
+            raise
+        else:
+            self.rejected = True
+            self.handshake_state = "rejected"
+            self._signal(self.coordinator_task, _DECISION_SIGNAL)
+
+    def _fail_handshake(self, error: BaseException) -> None:
+        if self.handshake_state == "failed":
+            return
+        self.accepted = False
+        self.rejected = False
+        self.protocol = None
+        self.handshake_state = "failed"
+        self.handshake_error = error
+        if isinstance(error, (KeyboardInterrupt, SystemExit)):
+            self.fatal_error = error
+        self._disconnect(1006)
 
     def _require_open(self) -> None:
         if not self.accepted:
@@ -456,8 +501,21 @@ class _WebSocketState:
 
     async def ping(self, payload: bytes) -> None:
         self._require_open()
-        await self._enqueue(self.api.Ping(payload=payload), len(payload), wait=True)
+        if self._pending_ping_generation is not None:
+            raise WebSocketStateError("a WebSocket Ping is already awaiting Pong")
+        self._ping_generation += 1
+        generation = self._ping_generation
+        self._pending_ping_generation = generation
+        self._pending_ping_payload = payload
         self.pong_deadline = time.monotonic() + self.config.pong_timeout
+        try:
+            await self._enqueue(
+                self.api.Ping(payload=payload), len(payload), wait=True
+            )
+        except BaseException:
+            if self._pending_ping_generation == generation:
+                self._clear_pending_ping()
+            raise
 
     async def close(self, code: int, reason: str) -> None:
         self._require_open()
@@ -465,13 +523,18 @@ class _WebSocketState:
             raise ValueError("invalid WebSocket close code")
         if not isinstance(reason, str) or len(reason.encode("utf-8")) > 123:
             raise ValueError("WebSocket close reason must be at most 123 UTF-8 bytes")
-        await self._enqueue(
-            self.api.CloseConnection(code=code, reason=reason),
-            2 + len(reason.encode("utf-8")),
-            wait=True,
-        )
+        reason_bytes = reason.encode("utf-8")
         self.close_sent = True
         self.close_deadline = time.monotonic() + self.config.close_timeout
+        try:
+            await self._enqueue(
+                self.api.CloseConnection(code=code, reason=reason),
+                2 + len(reason_bytes),
+                wait=True,
+            )
+        except BaseException:
+            self._disconnect(code, reason)
+            raise
         task = self._current_task()
         while not self.peer_closed and time.monotonic() < self.close_deadline:
             await task.sleep(min(self.config.deadline_resolution, self.config.close_timeout))
@@ -494,6 +557,45 @@ class _WebSocketState:
                 await waiter.wait_signal(_ACK_SIGNAL)
             if command.error is not None:
                 raise command.error
+
+    def _clear_pending_ping(self) -> None:
+        self._pending_ping_generation = None
+        self._pending_ping_payload = None
+        self.pong_deadline = None
+
+    def _fail_outbound(self, error: BaseException) -> None:
+        commands = list(self.outbox)
+        self.outbox.clear()
+        self.outbox_bytes = 0
+        if self.active_command is not None:
+            commands.insert(0, self.active_command)
+        seen: set[int] = set()
+        for command in commands:
+            if id(command) in seen:
+                continue
+            seen.add(id(command))
+            command.error = error
+            command.done = True
+            self._signal(command.waiter, _ACK_SIGNAL)
+
+    def _cancel_task(self, target: Any) -> None:
+        if target is None or target is getattr(self.runtime, "cursor", None):
+            return
+        try:
+            self.runtime.cancel_task(target)
+        except (KeyboardInterrupt, SystemExit) as exc:
+            self.fatal_error = exc
+            raise
+        except BaseException:
+            # ServerHandle retains ownership and retries cancellation in finalization.
+            pass
+
+    def _abort_writer(self, error: BaseException) -> None:
+        self._fail_outbound(error)
+        self._cancel_task(self.writer_task)
+
+    def _cancel_handler(self) -> None:
+        self._cancel_task(self.handler_task)
 
     def _enqueue_control(self, event: Any, size: int = 0) -> bool:
         if (
@@ -533,7 +635,11 @@ class _WebSocketState:
                 self.api.CloseConnection(code=code, reason="server shutdown"), 17
             )
             self.close_sent = True
-        self._disconnect(code, "server shutdown")
+        if self.handshake_state in {"pending", "accepting", "rejecting"}:
+            self._fail_handshake(WebSocketDisconnect(code, "server shutdown"))
+        else:
+            self._disconnect(code, "server shutdown")
+        self._cancel_handler()
         self._signal(self.writer_task, _OUTBOX_SIGNAL)
 
 
@@ -541,6 +647,14 @@ def _token_list(value: str | None) -> tuple[str, ...]:
     if value is None:
         return ()
     return tuple(token.strip() for token in value.split(",") if token.strip())
+
+
+def _is_http_token(value: str) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and all(character in _HTTP_TOKEN_CHARACTERS for character in value)
+    )
 
 
 def _message_size(value: str | bytes) -> int:
@@ -597,6 +711,15 @@ def _validate_upgrade(
         )
     if not _valid_websocket_key(request.headers.get("sec-websocket-key")):
         return Response.text("invalid WebSocket key", status=400)
+    offered_subprotocols = _token_list(
+        request.headers.get("sec-websocket-protocol")
+    )
+    offered_header = request.headers.get("sec-websocket-protocol")
+    if offered_header is not None and (
+        not offered_subprotocols
+        or any(not _is_http_token(protocol) for protocol in offered_subprotocols)
+    ):
+        return Response.text("invalid WebSocket subprotocol", status=400)
     origin = request.headers.get("origin")
     if route.origins is not None and origin not in route.origins:
         return Response.text("WebSocket origin is not allowed", status=403)
@@ -626,9 +749,11 @@ async def run_websocket_connection(
         state.deadline_task = spawn(
             _run_deadlines, "smallserver-websocket-deadline"
         )
-        while not state.accepted and not state.rejected and state.disconnect is None:
+        while state.handshake_state in {"pending", "accepting", "rejecting"}:
             await task.wait_signal(_DECISION_SIGNAL)
         if not state.accepted:
+            if state.fatal_error is not None:
+                raise state.fatal_error
             return
         state.writer_task = spawn(_run_writer, "smallserver-websocket-writer")
         state.reader_task = spawn(_run_reader, "smallserver-websocket-reader")
@@ -639,22 +764,33 @@ async def run_websocket_connection(
         except BaseException as exc:
             state.handler_error = exc
 
+        if isinstance(state.handler_error, (KeyboardInterrupt, SystemExit)):
+            raise state.handler_error
+        if state.fatal_error is not None:
+            raise state.fatal_error
+
         if state.handler_error is not None and not state.close_sent:
             try:
+                state.close_deadline = time.monotonic() + state.config.close_timeout
                 await state._enqueue(
                     state.api.CloseConnection(code=1011, reason="handler failed"),
                     16,
                     wait=True,
                 )
                 state.close_sent = True
+            except (KeyboardInterrupt, SystemExit):
+                raise
             except BaseException:
                 pass
         elif not state.close_sent and state.disconnect is None:
             try:
+                state.close_deadline = time.monotonic() + state.config.close_timeout
                 await state._enqueue(
                     state.api.CloseConnection(code=1000, reason=""), 2, wait=True
                 )
                 state.close_sent = True
+            except (KeyboardInterrupt, SystemExit):
+                raise
             except BaseException:
                 pass
 
@@ -688,16 +824,27 @@ async def _run_handler(task: Any, state: _WebSocketState) -> None:
         await result
     except WebSocketDisconnect:
         pass
+    except GeneratorExit:
+        raise
+    except (KeyboardInterrupt, SystemExit) as exc:
+        state.handler_error = exc
+        if state.handshake_state in {"pending", "accepting", "rejecting"}:
+            state._fail_handshake(exc)
+        raise
     except BaseException as exc:
         state.handler_error = exc
     finally:
-        if not state.accepted and not state.rejected:
+        if state.handshake_state == "pending":
             response = Response.text(
                 "internal server error" if state.handler_error is not None else "forbidden",
                 status=500 if state.handler_error is not None else 403,
             )
             try:
                 await state.reject(response)
+            except (KeyboardInterrupt, SystemExit) as exc:
+                state.handler_error = exc
+                state.fatal_error = exc
+                raise
             except BaseException:
                 state._disconnect(1006)
         state._signal(state.coordinator_task, _DECISION_SIGNAL)
@@ -709,6 +856,8 @@ async def _run_writer(task: Any, state: _WebSocketState) -> None:
             command = state.outbox.popleft()
             state.outbox_bytes -= command.size
             state.writer_busy = True
+            state.active_command = command
+            state.write_deadline = time.monotonic() + state.config.write_timeout
             try:
                 payload = state.protocol.send(command.event)
                 for offset in range(0, len(payload), state.config.write_chunk_bytes):
@@ -718,11 +867,23 @@ async def _run_writer(task: Any, state: _WebSocketState) -> None:
                         payload[offset : offset + state.config.write_chunk_bytes],
                     )
                 state.last_activity = time.monotonic()
+            except GeneratorExit:
+                raise
+            except (KeyboardInterrupt, SystemExit) as exc:
+                command.error = exc
+                state.fatal_error = exc
+                state._disconnect(1006)
+                state._cancel_handler()
+                raise
             except BaseException as exc:
                 command.error = exc
                 state._disconnect(1006)
+                state._cancel_handler()
             finally:
                 state.writer_busy = False
+                if state.active_command is command:
+                    state.active_command = None
+                state.write_deadline = None
                 command.done = True
                 state._signal(command.waiter, _ACK_SIGNAL)
         if not state.shutdown:
@@ -744,11 +905,14 @@ async def _run_reader(task: Any, state: _WebSocketState) -> None:
                 state.protocol.receive_data(None)
                 _drain_protocol_events(state)
                 state._disconnect(1006)
+                state._cancel_handler()
                 return
             state.last_activity = time.monotonic()
             _receive_protocol_data(state, chunk)
             if _drain_protocol_events(state):
                 return
+    except GeneratorExit:
+        raise
     except WebSocketCapacityError:
         if state.shutdown:
             return
@@ -757,6 +921,12 @@ async def _run_reader(task: Any, state: _WebSocketState) -> None:
         )
         state.close_sent = True
         state._disconnect(1009, "message too large")
+        state._cancel_handler()
+    except (KeyboardInterrupt, SystemExit) as exc:
+        state.fatal_error = exc
+        state._disconnect(1006)
+        state._cancel_handler()
+        raise
     except BaseException:
         if state.shutdown:
             return
@@ -765,6 +935,7 @@ async def _run_reader(task: Any, state: _WebSocketState) -> None:
         )
         state.close_sent = True
         state._disconnect(1002, "protocol error")
+        state._cancel_handler()
 
 
 def _receive_protocol_data(state: _WebSocketState, data: bytes) -> None:
@@ -778,22 +949,27 @@ def _drain_protocol_events(state: _WebSocketState) -> bool:
             kind = str if isinstance(event, state.api.TextMessage) else bytes
             if state._message_kind is None:
                 state._message_kind = kind
-                state._message_parts = []
+                state._message_buffer.clear()
                 state._message_bytes = 0
             if state._message_kind is not kind:
                 raise ValueError("WebSocket message type changed during fragmentation")
             state._message_bytes += _message_size(event.data)
             if state._message_bytes > state.config.max_message_bytes:
                 raise WebSocketCapacityError("WebSocket message is too large")
-            state._message_parts.append(event.data)
+            encoded = (
+                event.data.encode("utf-8")
+                if isinstance(event.data, str)
+                else event.data
+            )
+            state._message_buffer.extend(encoded)
             if event.message_finished:
                 value = (
-                    "".join(state._message_parts)
+                    bytes(state._message_buffer).decode("utf-8")
                     if kind is str
-                    else b"".join(state._message_parts)
+                    else bytes(state._message_buffer)
                 )
                 state._message_kind = None
-                state._message_parts = []
+                state._message_buffer.clear()
                 state._message_bytes = 0
                 if not state._deliver_message(value):
                     raise WebSocketCapacityError("WebSocket inbound queue is full")
@@ -801,43 +977,101 @@ def _drain_protocol_events(state: _WebSocketState) -> bool:
             if not state._enqueue_control(event.response(), len(event.payload)):
                 raise WebSocketCapacityError("WebSocket outbound queue is full")
         elif isinstance(event, state.api.Pong):
-            state.pong_deadline = None
+            _handle_pong(state, event.payload)
         elif isinstance(event, state.api.CloseConnection):
             state.peer_closed = True
+            close_code = int(event.code)
+            disconnect_reason = event.reason or ""
             if not state.close_sent:
-                if not state._enqueue_control(event.response(), 2):
+                if close_code == 1002:
+                    response = state.api.CloseConnection(
+                        code=1002, reason="protocol error"
+                    )
+                elif close_code == 1007:
+                    response = state.api.CloseConnection(
+                        code=1007, reason="invalid payload"
+                    )
+                else:
+                    response = event.response()
+                if not state._enqueue_control(
+                    response, _close_event_size(response)
+                ):
                     raise WebSocketCapacityError("WebSocket outbound queue is full")
                 state.close_sent = True
-            state._disconnect(event.code, event.reason or "")
+            if close_code == 1002:
+                disconnect_reason = "protocol error"
+            elif close_code == 1007:
+                disconnect_reason = "invalid payload"
+            state._disconnect(close_code, disconnect_reason)
             return True
     return False
+
+
+def _handle_pong(state: _WebSocketState, payload: bytes) -> None:
+    if (
+        state._pending_ping_generation is not None
+        and payload == state._pending_ping_payload
+    ):
+        state._clear_pending_ping()
+
+
+def _close_event_size(event: Any) -> int:
+    if int(event.code) == 1005:
+        return 0
+    return 2 + len((event.reason or "").encode("utf-8"))
 
 
 async def _run_deadlines(task: Any, state: _WebSocketState) -> None:
     while not state.shutdown:
         await task.sleep(state.config.deadline_resolution)
         now = time.monotonic()
-        if not state.accepted and not state.rejected:
+        if state.handshake_state in {"pending", "accepting", "rejecting"}:
             if now - state.created_at >= state.config.handshake_timeout:
-                try:
-                    await state.reject(
-                        Response.text("WebSocket handshake timed out", status=408)
-                    )
-                except BaseException:
-                    state._disconnect(1006)
+                if state.handshake_state == "pending":
+                    try:
+                        await state.reject(
+                            Response.text("WebSocket handshake timed out", status=408)
+                        )
+                    except (KeyboardInterrupt, SystemExit) as exc:
+                        state.fatal_error = exc
+                        raise
+                    except BaseException:
+                        state._disconnect(1006)
+                else:
+                    error = WebSocketDisconnect(1006, "handshake timed out")
+                    state._fail_handshake(error)
+                    state._cancel_handler()
                 return
             continue
-        if state.accepted and now - state.last_activity >= state.config.idle_timeout:
-            state._enqueue_control(
-                state.api.CloseConnection(code=1001, reason="idle timeout"), 14
-            )
-            state.close_sent = True
-            state._disconnect(1001, "idle timeout")
-            return
         if state.pong_deadline is not None and now >= state.pong_deadline:
-            state._enqueue_control(
-                state.api.CloseConnection(code=1002, reason="Pong timeout"), 14
-            )
-            state.close_sent = True
-            state._disconnect(1002, "Pong timeout")
+            _begin_deadline_close(state, 1002, "Pong timeout")
+        elif state.accepted and now - state.last_activity >= state.config.idle_timeout:
+            _begin_deadline_close(state, 1001, "idle timeout")
+        if state.write_deadline is not None and now >= state.write_deadline:
+            error = WebSocketDisconnect(1006, "write timed out")
+            state._abort_writer(error)
+            state._cancel_handler()
+            state._disconnect(error.code, error.reason)
             return
+        if state.close_deadline is not None and now >= state.close_deadline:
+            error = state.disconnect or WebSocketDisconnect(1006, "close timed out")
+            state._abort_writer(error)
+            state._cancel_handler()
+            state._disconnect(error.code, error.reason)
+            return
+
+
+def _begin_deadline_close(
+    state: _WebSocketState, code: int, reason: str
+) -> None:
+    if not state.close_sent and state.protocol is not None:
+        reason_bytes = reason.encode("utf-8")
+        state._enqueue_control(
+            state.api.CloseConnection(code=code, reason=reason),
+            2 + len(reason_bytes),
+        )
+        state.close_sent = True
+    if state.close_deadline is None:
+        state.close_deadline = time.monotonic() + state.config.close_timeout
+    state._disconnect(code, reason)
+    state._cancel_handler()
