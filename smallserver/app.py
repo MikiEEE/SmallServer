@@ -10,11 +10,17 @@ from typing import Any
 
 from .errors import HTTPError
 from .http import Request, Response
-from .routing import RegexRouteConfig, RouteMatchTimeout, RoutePathTooLarge, Router
+from .routing import (
+    RegexRouteConfig,
+    RouteErrorEvent,
+    RouteMatchTimeout,
+    RoutePathTooLarge,
+    Router,
+)
 from .server import HTTPParseError, HTTPRequestParser, ServerConfig, ServerHandle
 
 Handler = Callable[[Request], Awaitable[Response]]
-RouteErrorObserver = Callable[[RouteMatchTimeout], None]
+RouteErrorObserver = Callable[[RouteErrorEvent], None]
 
 
 class SmallServer:
@@ -141,16 +147,18 @@ class SmallServer:
 
     async def dispatch(self, request: Request) -> Response:
         """Run a registered handler or return a deterministic HTTP response."""
-        try:
-            match = self._router.resolve(request.method, request.path)
-        except RoutePathTooLarge:
-            return Response.text("request target is too large", status=414)
-        if match.handler is None:
-            if match.allowed_methods:
-                return Response.text("method not allowed", status=405, headers={"Allow": ", ".join(match.allowed_methods)})
-            return Response.text("not found", status=404)
-        handler = match.handler
-        request = replace(request, path_params=match.path_params, route_pattern=match.route_pattern)
+        handler = self._router.static_handler(request.method, request.path)
+        if handler is None:
+            try:
+                match = self._router.resolve(request.method, request.path)
+            except RoutePathTooLarge:
+                return Response.text("request target is too large", status=414)
+            if match.handler is None:
+                if match.allowed_methods:
+                    return Response.text("method not allowed", status=405, headers={"Allow": ", ".join(match.allowed_methods)})
+                return Response.text("not found", status=404)
+            handler = match.handler
+            request = replace(request, path_params=match.path_params, route_pattern=match.route_pattern)
         try:
             result = handler(request)
             if not inspect.isawaitable(result):
@@ -259,7 +267,8 @@ class SmallServer:
         observer = self._route_error_observer
         if observer is None:
             return
+        event = RouteErrorEvent(route_id=error.route_id, category="route_match_timeout")
         try:
-            observer(error)
+            observer(event)
         except Exception:
             pass

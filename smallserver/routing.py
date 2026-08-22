@@ -34,6 +34,14 @@ class RoutePathTooLarge(RuntimeError):
 
 
 @dataclass(frozen=True)
+class RouteErrorEvent:
+    """Traceback-free, immutable routing failure data safe for observation."""
+
+    route_id: str
+    category: str
+
+
+@dataclass(frozen=True)
 class RegexRouteConfig:
     """Finite limits applied to regex registration and hostile request paths."""
 
@@ -97,6 +105,10 @@ class Router:
                 raise ValueError("route already registered: {} {}".format(key[0], path))
         for key in keys:
             self._static[key] = handler
+
+    def static_handler(self, method: str, path: str) -> Handler | None:
+        """Return an exact static handler without allocating match context."""
+        return self._static.get((method.upper(), path))
 
     def add_regex(self, pattern: str, methods: tuple[str, ...], handler: Handler) -> None:
         if not isinstance(pattern, str):

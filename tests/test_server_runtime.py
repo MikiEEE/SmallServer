@@ -1,4 +1,5 @@
 import importlib.util
+from dataclasses import FrozenInstanceError
 import socket
 import threading
 import unittest
@@ -6,24 +7,35 @@ import unittest
 from SmallPackage import SmallOS, Unix
 from SmallPackage.adapters.threads import ThreadAdapter
 
-from smallserver import AdapterRegistry, RegexRouteConfig, Response, RouteMatchTimeout, SmallServer
+from smallserver import (
+    AdapterRegistry,
+    RegexRouteConfig,
+    Request,
+    Response,
+    RouteErrorEvent,
+    SmallServer,
+)
 
 
 HAS_REGEX = importlib.util.find_spec("regex") is not None
 
 
 class SmallOSServerIntegrationTests(unittest.TestCase):
-    def _request(self, port: int, path: str) -> bytes:
+    def _exchange(self, port: int, payload: bytes) -> bytes:
         with socket.create_connection(("127.0.0.1", port), timeout=3) as connection:
-            connection.sendall(
-                "GET {} HTTP/1.1\r\nHost: localhost\r\n\r\n".format(path).encode("ascii")
-            )
+            connection.sendall(payload)
             chunks = []
             while True:
                 chunk = connection.recv(4096)
                 if not chunk:
                     return b"".join(chunks)
                 chunks.append(chunk)
+
+    def _request(self, port: int, path: str) -> bytes:
+        return self._exchange(
+            port,
+            "GET {} HTTP/1.1\r\nHost: localhost\r\n\r\n".format(path).encode("ascii"),
+        )
 
     def test_loopback_server_accepts_fragmented_request_and_shuts_down(self) -> None:
         runtime = SmallOS().setKernel(Unix())
@@ -168,13 +180,15 @@ class SmallOSServerIntegrationTests(unittest.TestCase):
     @unittest.skipUnless(HAS_REGEX, "regex-routes extra is not installed")
     def test_regex_timeout_is_observed_once_and_does_not_stop_server(self) -> None:
         runtime = SmallOS().setKernel(Unix())
-        observed: list[RouteMatchTimeout] = []
+        observed: list[RouteErrorEvent] = []
         app = SmallServer(
             RegexRouteConfig(match_timeout=0.001, total_match_timeout=0.005),
             route_error_observer=observed.append,
         )
 
-        @app.get_regex(r"/(a+)+$")
+        pattern_secret = "sensitive-pattern-marker"
+
+        @app.post_regex(r"/(a+)+$(?#sensitive-pattern-marker)")
         async def expensive(request):
             return Response()
 
@@ -188,12 +202,20 @@ class SmallOSServerIntegrationTests(unittest.TestCase):
             self.skipTest("the current sandbox does not permit loopback TCP binds")
 
         hostile_path = "/" + "a" * 5000 + "!"
+        authorization_secret = "Bearer sensitive-authorization-marker"
+        body_secret = b"sensitive-body-marker"
         received = []
         errors = []
 
         def client() -> None:
             try:
-                received.append(self._request(server.port, hostile_path))
+                request = (
+                    "POST {} HTTP/1.1\r\n"
+                    "Host: localhost\r\n"
+                    "Authorization: {}\r\n"
+                    "Content-Length: {}\r\n\r\n"
+                ).format(hostile_path, authorization_secret, len(body_secret)).encode("ascii")
+                received.append(self._exchange(server.port, request + body_secret))
                 received.append(self._request(server.port, "/health"))
             except BaseException as exc:
                 errors.append(exc)
@@ -207,8 +229,24 @@ class SmallOSServerIntegrationTests(unittest.TestCase):
         self.assertFalse(worker.is_alive())
         self.assertEqual(errors, [])
         self.assertEqual(len(observed), 1)
-        self.assertEqual(observed[0].route_id, "regex-route-1")
-        self.assertNotIn(hostile_path, str(observed[0]))
+        event = observed[0]
+        self.assertEqual(event.route_id, "regex-route-1")
+        self.assertEqual(event.category, "route_match_timeout")
+        with self.assertRaises(FrozenInstanceError):
+            event.route_id = "changed"  # type: ignore[misc]
+        self.assertFalse(hasattr(event, "__traceback__"))
+        self.assertFalse(hasattr(event, "__cause__"))
+        self.assertFalse(hasattr(event, "__context__"))
+
+        reachable = _reachable_objects(event)
+        reachable_strings = {value for value in reachable if isinstance(value, str)}
+        self.assertEqual(
+            reachable_strings,
+            {"route_id", "category", "regex-route-1", "route_match_timeout"},
+        )
+        self.assertFalse(any(isinstance(value, Request) for value in reachable))
+        for secret in (hostile_path, authorization_secret, body_secret.decode("ascii"), pattern_secret):
+            self.assertNotIn(secret, reachable_strings)
         self.assertTrue(received[0].startswith(b"HTTP/1.1 500 Internal Server Error\r\n"))
         self.assertNotIn(hostile_path.encode("ascii"), received[0])
         self.assertTrue(received[1].startswith(b"HTTP/1.1 200 OK\r\n"))
@@ -247,3 +285,24 @@ class SmallOSServerIntegrationTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertTrue(received[0].startswith(b"HTTP/1.1 414 URI Too Long\r\n"))
         self.assertNotIn(b"must not run", received[0])
+
+
+def _reachable_objects(root):
+    pending = [root]
+    seen = set()
+    result = []
+    while pending:
+        value = pending.pop()
+        identity = id(value)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        result.append(value)
+        if isinstance(value, dict):
+            pending.extend(value.keys())
+            pending.extend(value.values())
+        elif isinstance(value, (tuple, list, set, frozenset)):
+            pending.extend(value)
+        elif hasattr(value, "__dict__"):
+            pending.append(vars(value))
+    return result

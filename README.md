@@ -148,30 +148,35 @@ opaque route ID and becomes a sanitized 500 response on the network path.
 Applications can observe that failure without receiving the hostile target:
 
 ```python
-from smallserver import RouteMatchTimeout
+from smallserver import RouteErrorEvent
 
-def observe_route_error(error: RouteMatchTimeout) -> None:
-    logger.error("route matching failed: %s", error.route_id)
+def observe_route_error(event: RouteErrorEvent) -> None:
+    logger.error("route matching failed: %s (%s)", event.route_id, event.category)
 
 app = SmallServer(route_error_observer=observe_route_error)
 ```
 
-The synchronous observer runs once on the connection task and should return
-quickly; observer failures are isolated from the response path. A path above
-the configured regex-routing byte limit returns 414 before matching begins.
+The synchronous observer receives a fresh, immutable, traceback-free event
+containing only an opaque route ID and category. It runs once on the connection
+task and should return quickly; observer failures are isolated from the
+response path. A path above the configured regex-routing byte limit returns
+414 before matching begins.
 
 Requests retain the exact ASCII origin-form target in `request.raw_target`.
 Routing uses `request.path`, which excludes the query string;
 `request.query_string` contains the raw text after `?`. Neither paths nor named
 captures are percent-decoded, so `/files/a%2Fb` remains distinct from
-`/files/a/b`. `request.route_pattern` identifies the selected static path or
-regex pattern.
+`/files/a/b`. `request.route_pattern` identifies a selected regex pattern;
+static dispatch passes the original request through without adding route
+context.
 
 Run `python benchmarks/route_benchmark.py` for a same-process comparison of
 the pre-router dictionary dispatch model and current router dispatch. Its JSON
 also records configured versus observed hostile-pattern timeout when the extra
 is installed; rates are machine-specific and should be compared on the same
 host.
+Use `python benchmarks/route_benchmark.py --release` to enforce the documented
+static-dispatch floor of 80% of the legacy model across repeated rounds.
 
 Release validation can run `python tests/installed_regex_smoke.py` from an
 environment where the built `smallserver[regex-routes]` wheel is installed.
