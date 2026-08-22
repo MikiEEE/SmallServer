@@ -34,8 +34,14 @@ app.listen()
 The application must explicitly call `accept()` or `reject()` before using
 message operations. Returning without either decision sends a sanitized 403.
 Text, binary, fragmented messages, Ping/Pong, and Close are supported. Queue,
-frame, message, connection, handshake, idle, Pong, and close limits are finite
-and configurable through `WebSocketConfig`.
+frame, message, connection, handshake, idle, Pong, write, and close limits are
+finite and configurable through `WebSocketConfig`.
+
+Only one application Ping may await a Pong at a time. The timeout is armed
+before the frame is written, and only a Pong with the matching payload clears
+it. Handshake, idle, Pong, and close deadlines also bound cleanup when a peer
+stops reading; expired connections cancel handler work owned by that
+connection.
 
 An origin allowlist is strongly recommended when browser credentials or
 cookies are involved. A selected subprotocol must have been offered by the
