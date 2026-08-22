@@ -78,6 +78,9 @@ class HTTPRequestParserTests(unittest.TestCase):
                 self.kernel = FakeKernel()
                 self.cancelled = []
 
+            def fork(self, tasks) -> None:
+                pass
+
             def resume_task(self, task) -> None:
                 pass
 
@@ -107,6 +110,12 @@ class HTTPRequestParserTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.kernel = FakeKernel()
 
+            def fork(self, tasks) -> None:
+                pass
+
+            def resume_task(self, task) -> None:
+                pass
+
         runtime = Runtime()
         primary = RuntimeError("listen setup failed")
         runtime.kernel.operation_errors["listen"] = primary
@@ -128,6 +137,12 @@ class HTTPRequestParserTests(unittest.TestCase):
         class Runtime:
             def __init__(self) -> None:
                 self.kernel = FakeKernel()
+
+            def fork(self, tasks) -> None:
+                pass
+
+            def resume_task(self, task) -> None:
+                pass
 
         runtime = Runtime()
         runtime.kernel.invalid_wait_objects.add(id(runtime.kernel.wakeup.wait_object))
@@ -210,6 +225,12 @@ class HTTPRequestParserTests(unittest.TestCase):
         class Runtime:
             def __init__(self) -> None:
                 self.kernel = FakeKernel()
+
+            def fork(self, tasks) -> None:
+                pass
+
+            def resume_task(self, task) -> None:
+                pass
 
         for interrupt in (KeyboardInterrupt("stop"), SystemExit(7)):
             for close_failures in (0, 1):

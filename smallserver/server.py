@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from ._transport import KernelTransport, TransportHandle, WakeupChannel
 from .http import Headers, Request, Response
@@ -128,12 +128,15 @@ class ServerHandle:
         listener: TransportHandle,
         wakeup: WakeupChannel | None,
         config: ServerConfig,
+        on_finalized: Callable[[ServerHandle], None] | None = None,
     ) -> None:
         self._runtime = runtime
         self._transport = transport
         self._listener = listener
         self._wakeup = wakeup
         self._config = config
+        self._address = transport.local_address(listener)
+        self._on_finalized = on_finalized
         self._close_requested = False
         self._notification_sent = False
         self._finalization_attempted = False
@@ -142,6 +145,9 @@ class ServerHandle:
         self._cleanup_errors: dict[str, BaseException] = {}
         self._listener_task: Any = None
         self._listener_resumed = False
+        self._close_task: Any = None
+        self._owned_tasks: list[Any] = []
+        self._cancelled_task_ids: set[int] = set()
         self._connections: dict[int, tuple[TransportHandle, Any]] = {}
         self._closing_connections: dict[int, TransportHandle] = {}
         self._pending_task_cancellations: dict[int, Any] = {}
@@ -149,7 +155,8 @@ class ServerHandle:
 
     @property
     def address(self) -> tuple[str, int]:
-        return self._transport.local_address(self._listener)
+        """Return the bound address, including after the handle is closed."""
+        return self._address
 
     @property
     def port(self) -> int:
@@ -224,6 +231,14 @@ class ServerHandle:
         self._wakeup.notify()
         self._notification_sent = True
 
+    def finalize(self) -> None:
+        """Release server resources after the caller-owned runtime has stopped.
+
+        Use :meth:`close` while the scheduler is running. This method is the
+        manual-runtime escape hatch for a scheduler startup or exit failure.
+        """
+        self._finish_close(owner_thread=True)
+
     async def close_from_task(self, task: Any) -> None:
         """Close or retry incomplete cleanup on the SmallOS scheduler thread."""
         if getattr(self._runtime, "cursor", None) is not task:
@@ -250,7 +265,18 @@ class ServerHandle:
             return
         self._finish_close(current_task=task)
 
-    def _finish_close(self, current_task: Any = None) -> None:
+    def _cancel_task(self, task: Any) -> None:
+        cancel_task = getattr(self._runtime, "cancel_task", None)
+        if callable(cancel_task):
+            try:
+                cancel_task(task)
+            except BaseException:
+                pass
+
+    def _finish_close(
+        self, current_task: Any = None, *, owner_thread: bool = False
+    ) -> None:
+        """Idempotently release every resource owned by this invocation."""
         if self._finished:
             return
         self._close_requested = True
@@ -276,19 +302,44 @@ class ServerHandle:
                 )
                 self._cleanup_errors["connection:{}".format(identity)] = error
 
+        retried_task_ids = set(self._pending_task_cancellations)
         for identity, task in list(self._pending_task_cancellations.items()):
             if self._cancel_or_retain_task(task):
                 self._pending_task_cancellations.pop(identity, None)
                 self._cleanup_errors.pop("task:{}".format(identity), None)
+                self._cancelled_task_ids.add(identity)
 
         for identity, (connection, task) in list(self._connections.items()):
-            if task is not current_task:
+            if owner_thread:
+                if (
+                    task is not current_task
+                    and id(task) not in self._cancelled_task_ids
+                    and id(task) not in retried_task_ids
+                ):
+                    if self._cancel_or_retain_task(task):
+                        self._cancelled_task_ids.add(id(task))
+            elif task is not current_task:
                 try:
                     self._runtime.resume_task(task)
                 except BaseException:
                     pass
+            if task is not current_task:
                 self._connections.pop(identity, None)
                 self._close_or_retain(connection, current_task)
+
+        if owner_thread:
+            for task in list(self._owned_tasks):
+                if (
+                    task is current_task
+                    or id(task) in self._cancelled_task_ids
+                    or id(task) in retried_task_ids
+                ):
+                    continue
+                if self._cancel_or_retain_task(task):
+                    self._cancelled_task_ids.add(id(task))
+            # Owner-thread finalization has cancelled the listener task; it
+            # must never be resumed by a later scheduler-side cleanup retry.
+            self._listener_resumed = True
         if (
             self._listener_task is not None
             and self._listener_task is not current_task
@@ -387,13 +438,17 @@ class ServerHandle:
     ) -> None:
         """Release a completed connection without losing failed-close ownership."""
         previous_count = self.owned_connection_count
-        self._connections.pop(id(connection), None)
+        entry = self._connections.pop(id(connection), None)
+        owned_task = entry[1] if entry is not None else task
+        if owned_task in self._owned_tasks:
+            self._owned_tasks.remove(owned_task)
         self._close_or_retain(connection, task, primary_error)
         self._notify_capacity_released(previous_count)
         self._update_finished()
 
     def _update_finished(self) -> None:
         wakeup_closed = self._wakeup is None or self._wakeup.closed
+        was_finished = self._finished
         self._finished = bool(
             self._close_requested
             and wakeup_closed
@@ -404,26 +459,14 @@ class ServerHandle:
         )
         if self._finished:
             self._cleanup_errors.clear()
+            if not was_finished:
+                callback = self._on_finalized
+                self._on_finalized = None
+                if callback is not None:
+                    callback(self)
 
-    def _abort_startup(
-        self, tasks: tuple[Any, ...]
-    ) -> tuple[tuple[Any, BaseException], ...]:
+    def _abort_startup(self, tasks: tuple[Any, ...]) -> None:
         """Release bound resources after task registration fails."""
         self._close_requested = True
-        failures: list[tuple[Any, BaseException]] = []
-        cancel_task = getattr(self._runtime, "cancel_task", None)
-        for task in reversed(tasks):
-            try:
-                if callable(cancel_task):
-                    cancel_task(task)
-                else:
-                    task_cancel = getattr(task, "cancel", None)
-                    if not callable(task_cancel):
-                        raise RuntimeError(
-                            "runtime cannot cancel a startup task"
-                        )
-                    task_cancel()
-            except BaseException as exc:
-                failures.append((task, exc))
-        self._finish_close()
-        return tuple(failures)
+        self._owned_tasks = list(tasks)
+        self._finish_close(owner_thread=True)

@@ -1,11 +1,13 @@
 import socket
 import threading
+import time
 import unittest
 
 from SmallPackage import SmallOS, Unix
 from SmallPackage.adapters.threads import ThreadAdapter
 
 from smallserver import AdapterRegistry, Response, SmallServer
+from smallserver.server import ServerHandle
 
 
 class SmallOSServerIntegrationTests(unittest.TestCase):
@@ -183,3 +185,47 @@ class SmallOSServerIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(runtime.ioReadWaiters, {})
         self.assertEqual(runtime.ioWriteWaiters, {})
+
+    def test_managed_listen_serves_loopback_and_returns_closed_handle(self) -> None:
+        app = SmallServer()
+
+        @app.get("/health")
+        async def health(request):
+            return Response.json({"status": "ok"})
+
+        returned: list[object] = []
+        errors: list[BaseException] = []
+
+        def run_server() -> None:
+            try:
+                returned.append(app.listen(host="127.0.0.1", port=0))
+            except BaseException as exc:
+                errors.append(exc)
+
+        worker = threading.Thread(target=run_server, daemon=True)
+        worker.start()
+        handle = None
+        for _ in range(200):
+            candidate = app._active_invocation
+            if isinstance(candidate, ServerHandle):
+                handle = candidate
+                break
+            if errors:
+                break
+            time.sleep(0.01)
+        if errors and isinstance(errors[0], PermissionError):
+            self.skipTest("the current sandbox does not permit loopback TCP binds")
+        self.assertEqual(errors, [])
+        self.assertIsNotNone(handle)
+        assert handle is not None
+
+        response = self._request(handle.port, "/health")
+        handle.close()
+        worker.join(timeout=3)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(returned, [handle])
+        self.assertTrue(handle.closed)
+        self.assertEqual(handle.port, returned[0].port)
+        self.assertIn(b"HTTP/1.1 200 OK", response)
