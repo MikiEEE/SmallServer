@@ -4,9 +4,14 @@ import unittest
 import warnings
 from unittest.mock import patch
 
-from smallserver import ServerStartupError, SmallServer
+from smallserver import RouteErrorEvent, ServerStartupError, SmallServer
 from smallserver.errors import _CleanupTransaction
-from smallserver.server import HTTPParseError, HTTPRequestParser, ServerConfig
+from smallserver.server import (
+    HTTPParseError,
+    HTTPRequestParser,
+    RouteObserverChannel,
+    ServerConfig,
+)
 
 from tests.kernel_fakes import FakeKernel
 
@@ -69,6 +74,76 @@ class HTTPRequestParserTests(unittest.TestCase):
         self.assertEqual(runtime.cancelled, 2)
         self.assertEqual([handle.name for handle in runtime.kernel.closed], ["listener"])
         self.assertEqual(runtime.kernel.wakeup.close_calls, 1)
+
+    def test_observer_task_is_owned_by_startup_rollback(self) -> None:
+        class Runtime:
+            def __init__(self) -> None:
+                self.kernel = FakeKernel()
+                self.tasks = []
+                self.cancelled = []
+
+            def fork(self, tasks) -> None:
+                self.tasks = list(tasks)
+                raise RuntimeError("no task capacity")
+
+            def cancel_task(self, task) -> None:
+                self.cancelled.append(task)
+                task.cancel()
+
+            def resume_task(self, task) -> None:
+                pass
+
+        runtime = Runtime()
+        app = SmallServer(route_error_observer=lambda event: None)
+        with self.assertRaisesRegex(RuntimeError, "capacity"):
+            app.serve(runtime)
+
+        self.assertEqual(runtime.cancelled, runtime.tasks)
+        self.assertEqual(
+            [task.name for task in runtime.tasks],
+            [
+                "smallserver-listener",
+                "smallserver-close-watcher",
+                "smallserver-route-observer",
+            ],
+        )
+        self.assertEqual([handle.name for handle in runtime.kernel.closed], ["listener"])
+        self.assertEqual(runtime.kernel.wakeup.close_calls, 1)
+
+    def test_route_observer_channel_is_bounded_and_stop_wakes_task(self) -> None:
+        class ObserverTask:
+            done = False
+            signals = []
+
+            @staticmethod
+            def getID() -> int:
+                return 9
+
+            def acceptSignal(self, signal) -> int:
+                self.signals.append(signal)
+                return 0
+
+        class SourceTask:
+            signals = []
+
+            def sendSignal(self, task_id, signal) -> int:
+                self.signals.append((task_id, signal))
+                return 0
+
+        observer_task = ObserverTask()
+        source_task = SourceTask()
+        channel = RouteObserverChannel(lambda event: None, max_events=1)
+        channel.bind(observer_task)
+        event = RouteErrorEvent("regex-route-1", "route_match_timeout")
+
+        self.assertTrue(channel.enqueue(event, source_task))
+        self.assertFalse(channel.enqueue(event, source_task))
+        channel.stop()
+
+        self.assertEqual(source_task.signals, [(9, 31)])
+        self.assertEqual(observer_task.signals, [31])
+        self.assertEqual(channel.dropped, 2)
+        self.assertEqual(list(channel.events), [])
 
     def test_serve_closes_kernel_resources_when_task_construction_fails(self) -> None:
         from SmallPackage import SmallTask as RealSmallTask
