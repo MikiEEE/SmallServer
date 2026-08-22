@@ -1,8 +1,8 @@
 # Routing
 
-SmallServer currently matches a request method and path exactly. Register
-routes with `get`, `post`, `put`, `patch`, `delete`, or the multi-method
-`route` decorator.
+SmallServer gives exact static routes precedence, then evaluates optional
+timeout-bounded regex routes in registration order. Register static routes
+with `get`, `post`, `put`, `patch`, `delete`, or `route`.
 
 ```python
 from smallserver import Response, SmallServer
@@ -32,14 +32,19 @@ An ordinary handler exception becomes a generic 500 when the network server
 invokes it. A direct call to `await app.dispatch(request)` preserves ordinary
 exceptions for tests and embedding code.
 
-## Static-path boundary
+## Request targets and regex routes
 
-This base does not parse path parameters or split query strings. The request
-target is matched as received, so `/items` and `/items?limit=10` are different
-route keys. Register stable static paths and parse only data whose format your
-application explicitly controls.
+Routing uses `request.path`; the undecoded query remains in
+`request.query_string`, and `request.raw_target` preserves both. Install
+`smallserver[regex-routes]` to register full-path expressions:
 
-Timeout-bounded regex routes and captured parameters are being developed as an
-optional route form; see the [protocol and feature roadmap](protocol-roadmap.md#routing-extensions).
-Do not write base-compatible examples that assume `/items/{id}` or automatic
-query parsing.
+```python
+@app.get_regex(r"/items/(?P<item_id>[0-9]+)")
+async def item(request):
+    return Response.json({"id": request.path_params["item_id"]})
+```
+
+Only named captures are exposed, as an immutable mapping. Patterns, paths,
+route counts, captures, individual matches, and total matching time are
+bounded by `RegexRouteConfig`. This is an explicit regex API, not automatic
+`/items/{id}` template parsing or percent decoding.

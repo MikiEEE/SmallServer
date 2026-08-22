@@ -16,6 +16,8 @@ config = ServerConfig(
     listener_priority=1,
     connection_priority=2,
     accept_batch_size=16,
+    max_request_target_bytes=8 * 1024,
+    max_route_error_events=16,
 )
 ```
 
@@ -29,6 +31,8 @@ config = ServerConfig(
 | `listener_priority` | 1 | SmallOS listener and close-watcher task priority. |
 | `connection_priority` | 2 | SmallOS connection-task priority. |
 | `accept_batch_size` | 16 | Accepts before the listener explicitly yields. |
+| `max_request_target_bytes` | 8 KiB | Maximum HTTP/1.1 origin-form request target. |
+| `max_route_error_events` | 16 | Bounded sanitized regex-timeout observer queue. |
 
 Every field must be a positive integer; booleans are rejected. The public port
 must be an integer from 0 through 65535. `port=0` delegates port selection to
@@ -50,3 +54,7 @@ prior-knowledge HTTP/2. Its finite limits cover streams, decoded and compressed
 headers, request and response buffers, generated control output, frame size,
 reader frame batches, handshake time, and idle time. See
 [Cleartext HTTP/2](http2.md) for the complete protocol boundary.
+
+`RegexRouteConfig` separately bounds optional regex pattern length, route and
+capture counts, path bytes, per-match time, and total matching time. All time
+limits must be finite positive numbers.

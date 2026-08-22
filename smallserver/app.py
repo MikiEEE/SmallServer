@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Awaitable, Callable, Iterable
+from dataclasses import replace
 from typing import Any, Literal, NoReturn, Protocol, cast, overload
 
 try:
@@ -25,9 +26,24 @@ from .errors import (
 )
 from .http import Request, Response
 from .http2 import HTTP2Config, H2Protocol, require_http2
-from .server import HTTPParseError, HTTPRequestParser, ServerConfig, ServerHandle
+from .routing import (
+    RegexRouteConfig,
+    RouteErrorEvent,
+    RouteMatchTimeout,
+    RoutePathTooLarge,
+    Router,
+)
+from .server import (
+    HTTPParseError,
+    HTTPRequestParser,
+    RouteObserverChannel,
+    ServerConfig,
+    ServerHandle,
+    run_route_observer,
+)
 
 Handler = Callable[[Request], Awaitable[Response]]
+RouteErrorObserver = Callable[[RouteErrorEvent], None]
 _METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE"})
 _HTTP2_WRITER_SIGNAL = 30
 _HTTP2_SHUTDOWN_SIGNAL = 29
@@ -153,8 +169,19 @@ class _HandleCleanupTransaction(_CleanupTransaction):
 class SmallServer:
     """Register static HTTP routes and dispatch requests to async handlers."""
 
-    def __init__(self) -> None:
-        self._routes: dict[tuple[str, str], Handler] = {}
+    def __init__(
+        self,
+        regex_config: RegexRouteConfig | None = None,
+        *,
+        route_error_observer: RouteErrorObserver | None = None,
+    ) -> None:
+        if route_error_observer is not None and not callable(route_error_observer):
+            raise TypeError("route_error_observer must be callable or None")
+        self._router = Router(regex_config)
+        # Preserve the original private static-route map for existing tooling
+        # while the Router owns all registration and lookup behavior.
+        self._routes = self._router._static
+        self._route_error_observer = route_error_observer
         self._active_invocation: object | ServerHandle | None = None
         self._invocation_lock: Any = (
             allocate_lock() if allocate_lock is not None else _NoThreadLock()
@@ -184,20 +211,14 @@ class SmallServer:
     def route(self, path: str, methods: Iterable[str]) -> Callable[[Handler], Handler]:
         if not isinstance(path, str) or not path.startswith("/"):
             raise ValueError("route path must start with '/'")
-        normalized = tuple(dict.fromkeys(method.upper() for method in methods))
-        if not normalized or any(method not in _METHODS for method in normalized):
-            raise ValueError("routes must use one or more supported HTTP methods")
+        if "?" in path or "#" in path:
+            raise ValueError("route path must not contain a query string or fragment")
+        normalized = self._router.normalize_methods(methods)
 
         def register(handler: Handler) -> Handler:
             if not callable(handler):
                 raise TypeError("route handler must be callable")
-            keys = [(method, path) for method in normalized]
-            for method, key_path in keys:
-                key = (method, key_path)
-                if key in self._routes:
-                    raise ValueError("route already registered: {} {}".format(method, path))
-            for key in keys:
-                self._routes[key] = handler
+            self._router.add_static(path, normalized, handler)
             return handler
 
         return register
@@ -216,6 +237,33 @@ class SmallServer:
 
     def delete(self, path: str) -> Callable[[Handler], Handler]:
         return self.route(path, ("DELETE",))
+
+    def route_regex(self, pattern: str, methods: Iterable[str]) -> Callable[[Handler], Handler]:
+        """Register a timeout-bounded full-path regular-expression route."""
+        normalized = self._router.normalize_methods(methods)
+
+        def register(handler: Handler) -> Handler:
+            if not callable(handler):
+                raise TypeError("route handler must be callable")
+            self._router.add_regex(pattern, normalized, handler)
+            return handler
+
+        return register
+
+    def get_regex(self, pattern: str) -> Callable[[Handler], Handler]:
+        return self.route_regex(pattern, ("GET",))
+
+    def post_regex(self, pattern: str) -> Callable[[Handler], Handler]:
+        return self.route_regex(pattern, ("POST",))
+
+    def put_regex(self, pattern: str) -> Callable[[Handler], Handler]:
+        return self.route_regex(pattern, ("PUT",))
+
+    def patch_regex(self, pattern: str) -> Callable[[Handler], Handler]:
+        return self.route_regex(pattern, ("PATCH",))
+
+    def delete_regex(self, pattern: str) -> Callable[[Handler], Handler]:
+        return self.route_regex(pattern, ("DELETE",))
 
     def serve(
         self,
@@ -389,6 +437,11 @@ class SmallServer:
         except BaseException:
             release_marker()
             raise
+        observer_channel = (
+            RouteObserverChannel(self._route_error_observer, config.max_route_error_events)
+            if self._route_error_observer is not None
+            else None
+        )
         try:
             listener = transport.open_listener(host, port, config.max_connections)
         except _TransportAcquisitionFailure as failure:
@@ -432,6 +485,7 @@ class SmallServer:
                 on_finalized=release,
                 protocol=protocol,
                 protocol_config=http2_config or HTTP2Config(),
+                route_observer_channel=observer_channel,
             )
         except BaseException as primary_error:
             transaction = _CleanupTransaction()
@@ -472,6 +526,16 @@ class SmallServer:
                 tasks = (listener_task, close_task)
                 handle._close_task = close_task
                 handle._owned_tasks.append(close_task)
+            if observer_channel is not None:
+                observer_task = SmallTask(
+                    config.listener_priority,
+                    run_route_observer,
+                    args=(observer_channel,),
+                    name="smallserver-route-observer",
+                )
+                observer_channel.bind(observer_task)
+                tasks += (observer_task,)
+                handle._owned_tasks.append(observer_task)
             runtime.fork(list(tasks))
         except BaseException as primary_error:
             handle._abort_startup(tasks)
@@ -483,12 +547,21 @@ class SmallServer:
 
     async def dispatch(self, request: Request) -> Response:
         """Run a registered handler or return a deterministic HTTP response."""
-        handler = self._routes.get((request.method.upper(), request.path))
-        if handler is None:
-            allowed = sorted(method for method, path in self._routes if path == request.path)
-            if allowed:
-                return Response.text("method not allowed", status=405, headers={"Allow": ", ".join(allowed)})
-            return Response.text("not found", status=404)
+        handler = self._router.static_handler(request.method, request.path)
+        if handler is not None:
+            if request.path_params or request.route_pattern is not None:
+                request = replace(request, path_params={}, route_pattern=None)
+        else:
+            try:
+                match = self._router.resolve(request.method, request.path)
+            except RoutePathTooLarge:
+                return Response.text("request target is too large", status=414)
+            if match.handler is None:
+                if match.allowed_methods:
+                    return Response.text("method not allowed", status=405, headers={"Allow": ", ".join(match.allowed_methods)})
+                return Response.text("not found", status=404)
+            handler = match.handler
+            request = replace(request, path_params=match.path_params, route_pattern=match.route_pattern)
         try:
             result = handler(request)
             if not inspect.isawaitable(result):
@@ -579,8 +652,10 @@ class SmallServer:
             handle._config.max_header_bytes,
             handle._config.max_header_count,
             handle._config.max_body_bytes,
+            handle._config.max_request_target_bytes,
         )
         primary_error: BaseException | None = None
+        route_error_event: RouteErrorEvent | None = None
         try:
             while not handle.closed:
                 try:
@@ -602,6 +677,12 @@ class SmallServer:
                     continue
                 try:
                     response = await self.dispatch(request)
+                except RouteMatchTimeout as exc:
+                    route_error_event = RouteErrorEvent(
+                        route_id=exc.route_id,
+                        category="route_match_timeout",
+                    )
+                    response = Response.text("internal server error", status=500)
                 except Exception:
                     response = Response.text("internal server error", status=500)
                 await self._send_response(task, handle, client, response)
@@ -610,7 +691,17 @@ class SmallServer:
             primary_error = exc
             raise
         finally:
+            if route_error_event is not None:
+                self._enqueue_route_error(handle, route_error_event, task)
             handle._connection_finished(task, client, primary_error)
+
+    @staticmethod
+    def _enqueue_route_error(
+        handle: ServerHandle, event: RouteErrorEvent, task: Any
+    ) -> None:
+        observer_channel = handle._route_observer_channel
+        if observer_channel is not None:
+            observer_channel.enqueue(event, task)
 
     async def _send_response(
         self,
@@ -754,6 +845,16 @@ class SmallServer:
         try:
             try:
                 response = await self.dispatch(request)
+            except RouteMatchTimeout as exc:
+                self._enqueue_route_error(
+                    handle,
+                    RouteErrorEvent(
+                        route_id=exc.route_id,
+                        category="route_match_timeout",
+                    ),
+                    task,
+                )
+                response = Response.text("internal server error", status=500)
             except Exception:
                 response = Response.text("internal server error", status=500)
             state.protocol.queue_response(stream_id, response)

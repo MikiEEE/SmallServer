@@ -11,6 +11,13 @@ from .errors import (
 )
 from .http import Headers, Request, Response
 from .http2 import HTTP2Config
+from .routing import (
+    RegexRouteConfig,
+    RegexRoutesUnavailable,
+    RouteErrorEvent,
+    RouteMatchTimeout,
+    RoutePathTooLarge,
+)
 from .server import ServerConfig, ServerHandle
 
 if TYPE_CHECKING:
@@ -33,8 +40,13 @@ __all__ = [
     "Headers",
     "HTTPError",
     "HTTP2Config",
+    "RegexRouteConfig",
+    "RegexRoutesUnavailable",
     "Request",
     "Response",
+    "RouteErrorEvent",
+    "RouteMatchTimeout",
+    "RoutePathTooLarge",
     "ServerConfig",
     "ServerConfigurationError",
     "ServerFinalizationError",

@@ -13,6 +13,12 @@ The network server converts ordinary handler exceptions into a generic 500.
 `app.dispatch()` only catches `HTTPError`, so direct dispatch in tests preserves
 programming errors.
 
+A regex match timeout also becomes a generic 500. If configured,
+`route_error_observer` receives exactly one immutable, traceback-free
+`RouteErrorEvent` containing only an opaque route ID and category. Delivery is
+bounded and scheduler-local; dropped events and observer callback failures are
+reported by the corresponding `ServerHandle` counters.
+
 ## Configuration errors
 
 `ServerConfigurationError` reports a runtime or kernel capability that cannot
@@ -47,5 +53,5 @@ Observe these stable properties:
 - `owned_connection_count`: active and retained connection streams.
 
 SmallServer does not provide a logging backend, metrics registry, or tracing
-system in this base. Applications should report sanitized handle state and
+system. Applications should report sanitized handle state and
 their own handler/adapter telemetry without reaching into private attributes.
