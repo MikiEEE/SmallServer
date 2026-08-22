@@ -1,14 +1,17 @@
 # SmallServer
 
 SmallServer is a SmallOS-native web framework in early development. It provides
-a bounded HTTP/1.1 server, static async routing for GET, POST, PUT, PATCH, and
-DELETE, and explicit escape hatches for blocking and asyncio-native libraries.
+a bounded HTTP/1.1 server and async routing for GET, POST, PUT, PATCH, and
+DELETE. Static routes are built in, timeout-bounded regular-expression routes
+are available through an optional dependency, and explicit escape hatches
+support blocking and asyncio-native libraries.
 
 ## Current scope
 
 The current package provides an HTTP/1.1 baseline over a SmallOS runtime. It can:
 
-- register static async routes for GET, POST, PUT, PATCH, and DELETE;
+- register static or optional regular-expression async routes for GET, POST,
+  PUT, PATCH, and DELETE;
 - dispatch an already-created `Request` to a handler;
 - return deterministic `Response` values, including HTTP/1.1 bytes;
 - return 404 for an unknown path and 405 with `Allow` for a known path using
@@ -18,7 +21,8 @@ The current package provides an HTTP/1.1 baseline over a SmallOS runtime. It can
 - parse one `Content-Length` HTTP/1.1 request per connection and close after
   its response.
 
-Keep-alive/pipelining, TLS, path parameters, and HTTP/2 are not implemented yet.
+Keep-alive/pipelining, TLS, automatic path templates, and HTTP/2 are not
+implemented yet.
 
 ## Install for development
 
@@ -27,6 +31,14 @@ python3 -m pip install -r requirements.txt
 python3 -m pip install -e .
 python3 -m unittest discover -s tests -v
 ```
+
+Install the optional matching engine when an application uses raw regex routes:
+
+```bash
+python3 -m pip install -e '.[regex-routes]'
+```
+
+Static routing neither imports nor requires that dependency.
 
 SmallOS is installed from the canonical `master` branch in `requirements.txt`.
 It owns scheduling, socket readiness, and foreign execution adapters.
@@ -101,8 +113,42 @@ async def delete_widgets(request: Request) -> Response:
     return Response(status=204)
 ```
 
-Route paths are static in this release. Path parameters and richer lifecycle
-hooks are deferred; the current `ServerHandle` provides explicit shutdown.
+Static route lookup is dictionary-based and always takes precedence over a
+regex route for the same method and path. Richer lifecycle hooks are deferred;
+the current `ServerHandle` provides explicit shutdown.
+
+## Define regular-expression routes
+
+Regex routes use full-path matching and run in registration order after static
+lookup. Only named captures become immutable `request.path_params`; an optional
+group that did not participate is omitted.
+
+```python
+@app.get_regex(r"/users/(?P<user_id>[0-9]+)")
+async def get_user(request: Request) -> Response:
+    return Response.json({"user_id": request.path_params["user_id"]})
+
+@app.route_regex(
+    r"/articles/(?P<slug>[a-z0-9]+(?:-[a-z0-9]+)*)",
+    methods=("GET", "PATCH"),
+)
+async def article(request: Request) -> Response:
+    return Response.json({"slug": request.path_params["slug"]})
+```
+
+Patterns must begin with a literal `/` and do not need `^` or `$`. They are
+trusted application configuration, but paths are hostile input: SmallServer
+bounds pattern length, route count, named captures, path bytes, each match, and
+the total matching time. Prefer unambiguous repetition and narrow character
+classes even with these deadlines. A timeout raises `RouteMatchTimeout` with an
+opaque route ID and becomes a sanitized 500 response on the network path.
+
+Requests retain the exact ASCII origin-form target in `request.raw_target`.
+Routing uses `request.path`, which excludes the query string;
+`request.query_string` contains the raw text after `?`. Neither paths nor named
+captures are percent-decoded, so `/files/a%2Fb` remains distinct from
+`/files/a/b`. `request.route_pattern` identifies the selected static path or
+regex pattern.
 
 ## Dispatch a request
 
