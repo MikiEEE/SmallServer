@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Awaitable, Callable, Iterable
-import socket
 from typing import Any
 
+from ._transport import KernelTransport
 from .errors import HTTPError
 from .http import Request, Response
 from .server import HTTPParseError, HTTPRequestParser, ServerConfig, ServerHandle
@@ -77,31 +77,31 @@ class SmallServer:
         if not isinstance(port, int) or not 0 <= port <= 65535:
             raise ValueError("port must be an integer between 0 and 65535")
         config = config or ServerConfig()
-        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        transport = KernelTransport(getattr(runtime, "kernel", None))
+        listener = transport.open_listener(host, port, config.max_connections)
         try:
-            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            listener.bind((host, port))
-            listener.listen(config.max_connections)
-            listener.setblocking(False)
-        except BaseException:
-            listener.close()
+            wakeup = transport.create_wakeup_channel()
+        except Exception:
+            transport.close_safely(listener)
             raise
-        handle = ServerHandle(runtime, listener, config)
-        listener_task = SmallTask(
-            config.listener_priority,
-            self._accept_loop,
-            args=(handle,),
-            name="smallserver-listener",
-        )
-        close_task = SmallTask(
-            config.listener_priority,
-            self._close_watcher,
-            args=(handle,),
-            name="smallserver-close-watcher",
-        )
-        handle._listener_task = listener_task
-        tasks = (listener_task, close_task)
+        handle = ServerHandle(runtime, transport, listener, wakeup, config)
+        tasks: tuple[Any, ...] = ()
         try:
+            listener_task = SmallTask(
+                config.listener_priority,
+                self._accept_loop,
+                args=(handle,),
+                name="smallserver-listener",
+            )
+            tasks = (listener_task,)
+            close_task = SmallTask(
+                config.listener_priority,
+                self._close_watcher,
+                args=(handle,),
+                name="smallserver-close-watcher",
+            )
+            handle._listener_task = listener_task
+            tasks = (listener_task, close_task)
             runtime.fork(list(tasks))
         except BaseException:
             handle._abort_startup(tasks)
@@ -129,42 +129,48 @@ class SmallServer:
 
     async def _accept_loop(self, task: Any, handle: ServerHandle) -> None:
         while not handle.closed:
-            await task.wait_readable(handle._listener)
-            if handle.closed:
+            try:
+                accepted = await handle._transport.accept(task, handle._listener)
+            except Exception:
                 return
-            while not handle.closed:
-                try:
-                    client, _ = handle._listener.accept()
-                except BlockingIOError:
-                    break
-                except OSError:
-                    return
-                client.setblocking(False)
-                if len(handle._connections) >= handle._config.max_connections:
-                    client.close()
-                    continue
-                from SmallPackage import SmallTask
+            client = accepted.stream
+            if handle.closed or len(handle._connections) >= handle._config.max_connections:
+                handle._transport.close_safely(client)
+                continue
+            from SmallPackage import SmallTask
 
+            connection_task: Any = None
+            try:
                 connection_task = SmallTask(
                     handle._config.connection_priority,
                     self._connection_loop,
                     args=(handle, client),
                     name="smallserver-connection",
                 )
-                handle._connections[client] = connection_task
+                handle._connections[id(client)] = (client, connection_task)
                 runtime = handle._runtime
                 runtime.fork(connection_task)
+            except Exception:
+                handle._connections.pop(id(client), None)
+                if connection_task is not None:
+                    cancel_task = getattr(handle._runtime, "cancel_task", None)
+                    if callable(cancel_task):
+                        try:
+                            cancel_task(connection_task)
+                        except Exception:
+                            pass
+                handle._transport.close_safely(client)
+                continue
 
     async def _close_watcher(self, task: Any, handle: ServerHandle) -> None:
-        await task.wait_readable(handle._wake_read)
+        await task.wait_readable(handle._wakeup.wait_object)
         try:
-            while handle._wake_read.recv(1024):
-                pass
-        except (BlockingIOError, OSError):
+            handle._wakeup.drain()
+        except Exception:
             pass
         handle._finish_close()
 
-    async def _connection_loop(self, task: Any, handle: ServerHandle, client: socket.socket) -> None:
+    async def _connection_loop(self, task: Any, handle: ServerHandle, client: object) -> None:
         parser = HTTPRequestParser(
             handle._config.max_header_bytes,
             handle._config.max_header_count,
@@ -173,18 +179,19 @@ class SmallServer:
         try:
             while not handle.closed:
                 try:
-                    chunk = client.recv(handle._config.receive_chunk_bytes)
-                except BlockingIOError:
-                    await task.wait_readable(client)
-                    continue
-                except OSError:
+                    chunk = await handle._transport.recv(
+                        task, client, handle._config.receive_chunk_bytes
+                    )
+                except Exception:
                     return
                 if not chunk:
                     return
                 try:
                     request = parser.feed(chunk)
                 except HTTPParseError as exc:
-                    await self._send_response(task, client, Response.text(exc.detail, status=exc.status))
+                    await self._send_response(
+                        task, handle, client, Response.text(exc.detail, status=exc.status)
+                    )
                     return
                 if request is None:
                     continue
@@ -192,26 +199,20 @@ class SmallServer:
                     response = await self.dispatch(request)
                 except Exception:
                     response = Response.text("internal server error", status=500)
-                await self._send_response(task, client, response)
+                await self._send_response(task, handle, client, response)
                 return
         finally:
-            handle._connections.pop(client, None)
-            try:
-                client.close()
-            except OSError:
-                pass
+            handle._connections.pop(id(client), None)
+            handle._transport.close_safely(client)
 
-    async def _send_response(self, task: Any, client: socket.socket, response: Response) -> None:
+    async def _send_response(
+        self,
+        task: Any,
+        handle: ServerHandle,
+        client: object,
+        response: Response,
+    ) -> None:
         headers = {name: value for name, value in response.headers.items() if name.lower() != "connection"}
         headers["Connection"] = "close"
         payload = Response(response.status, response.body, headers).to_http1()
-        offset = 0
-        while offset < len(payload):
-            try:
-                sent = client.send(payload[offset:])
-            except BlockingIOError:
-                await task.wait_writable(client)
-                continue
-            if sent <= 0:
-                return
-            offset += sent
+        await handle._transport.send_all(task, client, payload)

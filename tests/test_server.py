@@ -4,6 +4,8 @@ from unittest.mock import patch
 from smallserver import SmallServer
 from smallserver.server import HTTPParseError, HTTPRequestParser, ServerConfig
 
+from tests.kernel_fakes import FakeKernel
+
 
 class HTTPRequestParserTests(unittest.TestCase):
     def parser(self) -> HTTPRequestParser:
@@ -41,38 +43,40 @@ class HTTPRequestParserTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "max_connections"):
             ServerConfig(max_connections=True)
 
-    def test_serve_closes_bound_socket_when_runtime_fork_fails(self) -> None:
-        class Listener:
-            closed = False
-
-            def setsockopt(self, *args) -> None:
-                pass
-
-            def bind(self, address) -> None:
-                pass
-
-            def listen(self, backlog) -> None:
-                pass
-
-            def setblocking(self, blocking) -> None:
-                pass
-
-            def close(self) -> None:
-                self.closed = True
-
+    def test_serve_closes_kernel_resources_when_runtime_fork_fails(self) -> None:
         class Runtime:
-            cancelled = 0
+            def __init__(self) -> None:
+                self.kernel = FakeKernel()
+                self.cancelled = 0
 
             def fork(self, tasks) -> None:
                 raise RuntimeError("no task capacity")
 
             def cancel_task(self, task) -> None:
                 self.cancelled += 1
+                task.coro.close()
 
-        listener = Listener()
+            def resume_task(self, task) -> None:
+                pass
+
         runtime = Runtime()
-        with patch("smallserver.app.socket.socket", return_value=listener):
-            with self.assertRaisesRegex(RuntimeError, "capacity"):
-                SmallServer().serve(runtime)
-        self.assertTrue(listener.closed)
+        with self.assertRaisesRegex(RuntimeError, "capacity"):
+            SmallServer().serve(runtime)
         self.assertEqual(runtime.cancelled, 2)
+        self.assertEqual([handle.name for handle in runtime.kernel.closed], ["listener"])
+        self.assertEqual(runtime.kernel.wakeup.close_calls, 1)
+
+    def test_serve_closes_kernel_resources_when_task_construction_fails(self) -> None:
+        class Runtime:
+            def __init__(self) -> None:
+                self.kernel = FakeKernel()
+
+            def resume_task(self, task) -> None:
+                pass
+
+        runtime = Runtime()
+        with patch("SmallPackage.SmallTask", side_effect=RuntimeError("task failed")):
+            with self.assertRaisesRegex(RuntimeError, "task failed"):
+                SmallServer().serve(runtime)
+        self.assertEqual([handle.name for handle in runtime.kernel.closed], ["listener"])
+        self.assertEqual(runtime.kernel.wakeup.close_calls, 1)
