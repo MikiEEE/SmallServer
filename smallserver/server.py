@@ -395,11 +395,24 @@ class ServerHandle:
             self._closing_connections.pop(identity, None)
             self._cleanup_errors.pop("connection:{}".format(identity), None)
             return True
-        self._closing_connections[identity] = connection
+        if identity not in self._connections:
+            self._closing_connections[identity] = connection
         error = connection.close_error or RuntimeError("kernel connection close failed")
         self._cleanup_errors["connection:{}".format(identity)] = error
         self._connection_close_failed(error, task, primary_error)
         return False
+
+    def _force_connection_close(
+        self,
+        connection: TransportHandle,
+        task: Any = None,
+        primary_error: BaseException | None = None,
+    ) -> bool:
+        """Stop graceful handling and close through retryable ownership."""
+        identity = id(connection)
+        self._graceful_connections.discard(identity)
+        self._graceful_closers.pop(identity, None)
+        return self._close_or_retain(connection, task, primary_error)
 
     def _connection_close_failed(
         self,

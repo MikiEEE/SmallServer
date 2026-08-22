@@ -25,7 +25,9 @@ class HTTP2Config:
     max_connection_buffer_bytes: int = 4 * 1024 * 1024
     max_pending_output_bytes: int = 4 * 1024 * 1024
     max_response_body_bytes: int = 2 * 1024 * 1024
+    max_control_output_bytes: int = 64 * 1024
     max_frame_size: int = 16 * 1024
+    reader_frame_batch_size: int = 32
     handshake_timeout: float = 10.0
     idle_timeout: float = 60.0
 
@@ -57,6 +59,14 @@ class HTTP2Config:
             raise ValueError(
                 "max_response_body_bytes cannot exceed max_pending_output_bytes"
             )
+        if self.max_control_output_bytes > self.max_pending_output_bytes:
+            raise ValueError(
+                "max_control_output_bytes cannot exceed max_pending_output_bytes"
+            )
+        if self.max_control_output_bytes < 9:
+            raise ValueError(
+                "max_control_output_bytes must allow one HTTP/2 control frame"
+            )
 
 
 @dataclass(frozen=True)
@@ -72,7 +82,7 @@ class _InboundStream:
     method: str
     path: str
     headers: Headers
-    body: bytearray
+    body: bytearray | bytes
     expected_content_length: int | None
     dispatched: bool = False
 
@@ -88,51 +98,91 @@ class _FrameBudget:
 
     def __init__(self, config: HTTP2Config) -> None:
         self._config = config
-        self._buffer = bytearray()
+        self._preface = bytearray()
+        self._header = bytearray()
+        self._payload = bytearray()
+        self._frame_length = 0
+        self._frame_type = 0
+        self._frame_flags = 0
+        self._frame_stream = 0
         self._preface_received = False
         self._header_stream: int | None = None
         self._header_bytes = 0
+        self._ready: list[bytes] = []
 
-    def feed(self, data: bytes) -> tuple[bytes, ...]:
-        self._buffer.extend(data)
-        chunks: list[bytes] = []
+    def feed(self, data: bytes) -> None:
+        view = memoryview(data)
+        offset = 0
         if not self._preface_received:
-            prefix_length = min(len(self._buffer), len(HTTP2_CLIENT_PREFACE))
-            if bytes(self._buffer[:prefix_length]) != HTTP2_CLIENT_PREFACE[:prefix_length]:
+            needed = len(HTTP2_CLIENT_PREFACE) - len(self._preface)
+            take = min(needed, len(view))
+            self._preface.extend(view[:take])
+            offset += take
+            if bytes(self._preface) != HTTP2_CLIENT_PREFACE[: len(self._preface)]:
                 raise ValueError("invalid HTTP/2 client preface")
-            if len(self._buffer) < len(HTTP2_CLIENT_PREFACE):
-                return ()
-            chunks.append(bytes(self._buffer[: len(HTTP2_CLIENT_PREFACE)]))
-            del self._buffer[: len(HTTP2_CLIENT_PREFACE)]
+            if len(self._preface) < len(HTTP2_CLIENT_PREFACE):
+                return
+            self._ready.append(bytes(self._preface))
+            self._preface.clear()
             self._preface_received = True
 
-        while len(self._buffer) >= 9:
-            length = int.from_bytes(self._buffer[:3], "big")
-            if length > self._config.max_frame_size:
-                raise ValueError("HTTP/2 frame exceeds configured maximum")
-            frame_length = 9 + length
-            if len(self._buffer) < frame_length:
-                break
-            frame_type = self._buffer[3]
-            flags = self._buffer[4]
-            stream_id = int.from_bytes(self._buffer[5:9], "big") & 0x7FFFFFFF
-            if frame_type == 0x1:
-                if self._header_stream is not None:
-                    raise ValueError("interleaved HTTP/2 header blocks are invalid")
-                self._header_stream = stream_id
-                self._header_bytes = length
-            elif frame_type == 0x9:
-                if self._header_stream != stream_id:
-                    raise ValueError("invalid HTTP/2 continuation stream")
-                self._header_bytes += length
-            if self._header_bytes > self._config.max_compressed_header_bytes:
-                raise ValueError("HTTP/2 compressed header block is too large")
-            if frame_type in (0x1, 0x9) and flags & 0x4:
-                self._header_stream = None
-                self._header_bytes = 0
-            chunks.append(bytes(self._buffer[:frame_length]))
-            del self._buffer[:frame_length]
+        while offset < len(view):
+            if len(self._header) < 9:
+                take = min(9 - len(self._header), len(view) - offset)
+                self._header.extend(view[offset : offset + take])
+                offset += take
+                if len(self._header) < 9:
+                    return
+                self._start_frame()
+                if self._frame_length == 0:
+                    self._finish_frame()
+                    continue
+            take = min(
+                self._frame_length - len(self._payload),
+                len(view) - offset,
+            )
+            self._payload.extend(view[offset : offset + take])
+            offset += take
+            if len(self._payload) == self._frame_length:
+                self._finish_frame()
+
+    def _start_frame(self) -> None:
+        length = int.from_bytes(self._header[:3], "big")
+        if length > self._config.max_frame_size:
+            raise ValueError("HTTP/2 frame exceeds configured maximum")
+        self._frame_length = length
+        self._frame_type = self._header[3]
+        self._frame_flags = self._header[4]
+        self._frame_stream = int.from_bytes(self._header[5:9], "big") & 0x7FFFFFFF
+        if self._frame_type == 0x1:
+            if self._header_stream is not None:
+                raise ValueError("interleaved HTTP/2 header blocks are invalid")
+            self._header_stream = self._frame_stream
+            self._header_bytes = length
+        elif self._frame_type == 0x9:
+            if self._header_stream != self._frame_stream:
+                raise ValueError("invalid HTTP/2 continuation stream")
+            self._header_bytes += length
+        if self._header_bytes > self._config.max_compressed_header_bytes:
+            raise ValueError("HTTP/2 compressed header block is too large")
+
+    def _finish_frame(self) -> None:
+        self._ready.append(bytes(self._header + self._payload))
+        if self._frame_type in (0x1, 0x9) and self._frame_flags & 0x4:
+            self._header_stream = None
+            self._header_bytes = 0
+        self._header.clear()
+        self._payload.clear()
+        self._frame_length = 0
+
+    def take(self, limit: int) -> tuple[bytes, ...]:
+        chunks = self._ready[:limit]
+        del self._ready[:limit]
         return tuple(chunks)
+
+    @property
+    def has_ready_frames(self) -> bool:
+        return bool(self._ready)
 
     @property
     def preface_received(self) -> bool:
@@ -249,6 +299,7 @@ class H2Protocol:
         self._commands: list[tuple[str, int, Response | None]] = []
         self._buffered_request_bytes = 0
         self._pending_output_bytes = 0
+        self._control_output = bytearray()
         self._cancelled_streams: list[int] = []
         self.last_processed_stream_id = 0
         self.remote_closed = False
@@ -260,7 +311,7 @@ class H2Protocol:
 
     @property
     def pending_output_bytes(self) -> int:
-        return self._pending_output_bytes
+        return self._pending_output_bytes + len(self._control_output)
 
     @property
     def buffered_request_bytes(self) -> int:
@@ -270,13 +321,18 @@ class H2Protocol:
     def preface_received(self) -> bool:
         return self._frames.preface_received
 
+    @property
+    def has_pending_input(self) -> bool:
+        return self._frames.has_ready_frames
+
     def initiate(self) -> bytes:
         self.connection.initiate_connection()
         return self.connection.data_to_send()
 
     def receive_data(self, data: bytes) -> tuple[H2ReadyRequest, ...]:
         ready: list[H2ReadyRequest] = []
-        for wire_chunk in self._frames.feed(data):
+        self._frames.feed(data)
+        for wire_chunk in self._frames.take(self.config.reader_frame_batch_size):
             events = self.connection.receive_data(wire_chunk)
             for event in events:
                 if isinstance(event, self._events["request"]):
@@ -300,7 +356,19 @@ class H2Protocol:
                     event, (self._events["window"], self._events["settings"])
                 ):
                     pass
+            self._capture_control_output()
         return tuple(ready)
+
+    def _capture_control_output(self) -> None:
+        produced = self.connection.data_to_send()
+        next_control_size = len(self._control_output) + len(produced)
+        if (
+            next_control_size > self.config.max_control_output_bytes
+            or next_control_size + self._pending_output_bytes
+            > self.config.max_pending_output_bytes
+        ):
+            raise ValueError("HTTP/2 control output exceeds configured maximum")
+        self._control_output.extend(produced)
 
     def take_cancelled_streams(self) -> tuple[int, ...]:
         """Return peer-reset stream ids exactly once."""
@@ -418,6 +486,9 @@ class H2Protocol:
         ):
             self._reset_stream(stream_id, self._error_codes.ENHANCE_YOUR_CALM)
             return
+        if not isinstance(stream.body, bytearray):
+            self._reset_stream(stream_id, self._error_codes.STREAM_CLOSED)
+            return
         stream.body.extend(data)
         self._buffered_request_bytes = next_connection_size
 
@@ -433,11 +504,13 @@ class H2Protocol:
             return None
         stream.dispatched = True
         self.last_processed_stream_id = max(self.last_processed_stream_id, stream_id)
+        body = bytes(stream.body)
+        stream.body = body
         request = Request(
             stream.method,
             stream.path,
             stream.headers,
-            bytes(stream.body),
+            body,
             "HTTP/2",
         )
         return H2ReadyRequest(stream_id, request)
@@ -449,7 +522,7 @@ class H2Protocol:
         body_size = len(response.body)
         if (
             body_size > self.config.max_response_body_bytes
-            or self._pending_output_bytes + body_size
+            or len(self._control_output) + self._pending_output_bytes + body_size
             > self.config.max_pending_output_bytes
         ):
             if not any(command[1] == stream_id for command in self._commands):
@@ -463,6 +536,8 @@ class H2Protocol:
         return True
 
     def flush(self) -> bytes:
+        control = bytes(self._control_output)
+        self._control_output.clear()
         commands, self._commands = self._commands, []
         for operation, stream_id, response in commands:
             if operation == "reset":
@@ -503,7 +578,7 @@ class H2Protocol:
             if end_stream:
                 self._outbound.pop(stream_id, None)
                 self._active_streams.discard(stream_id)
-        return self.connection.data_to_send()
+        return control + self.connection.data_to_send()
 
     def _start_response(self, stream_id: int, response: Response) -> None:
         headers: list[tuple[str, str]] = [(":status", str(response.status))]
@@ -578,4 +653,6 @@ class H2Protocol:
         self._active_streams.clear()
         self._buffered_request_bytes = 0
         self._pending_output_bytes = 0
-        return self.connection.data_to_send()
+        control = bytes(self._control_output)
+        self._control_output.clear()
+        return control + self.connection.data_to_send()

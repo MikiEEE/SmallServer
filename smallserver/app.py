@@ -662,6 +662,7 @@ class SmallServer:
             handle._runtime.fork(child_tasks)
             handle._graceful_connections.add(id(client))
             handle._graceful_closers[id(client)] = state.request_shutdown
+            reader_batches = 0
             while not handle.closed and not protocol.remote_closed:
                 chunk = await handle._transport.recv(
                     task, client, handle._config.receive_chunk_bytes
@@ -669,27 +670,41 @@ class SmallServer:
                 if not chunk:
                     break
                 state.mark_activity()
-                try:
-                    ready = protocol.receive_data(chunk)
-                except Exception as protocol_error:
-                    primary_error = protocol_error
-                    state.close_error_code = 1
+                next_data = chunk
+                while True:
+                    try:
+                        ready = protocol.receive_data(next_data)
+                    except Exception as protocol_error:
+                        primary_error = protocol_error
+                        state.close_error_code = 1
+                        break
+                    for stream_id in protocol.take_cancelled_streams():
+                        handler = state.handlers.pop(stream_id, None)
+                        if handler is not None:
+                            handle._cancel_or_retain_task(handler)
+                    for item in ready:
+                        handler = SmallTask(
+                            handle._config.connection_priority,
+                            self._http2_handler,
+                            args=(handle, state, item.stream_id, item.request),
+                            name="smallserver-http2-stream-{}".format(item.stream_id),
+                        )
+                        state.handlers[item.stream_id] = handler
+                        handle._owned_tasks.append(handler)
+                        handle._runtime.fork(handler)
+                    state.wake_writer()
+                    reader_batches += 1
+                    if protocol.has_pending_input:
+                        await task.yield_now()
+                        reader_batches = 0
+                        next_data = b""
+                        continue
+                    if reader_batches >= protocol.config.reader_frame_batch_size:
+                        await task.yield_now()
+                        reader_batches = 0
                     break
-                for stream_id in protocol.take_cancelled_streams():
-                    handler = state.handlers.pop(stream_id, None)
-                    if handler is not None:
-                        handle._cancel_or_retain_task(handler)
-                for item in ready:
-                    handler = SmallTask(
-                        handle._config.connection_priority,
-                        self._http2_handler,
-                        args=(handle, state, item.stream_id, item.request),
-                        name="smallserver-http2-stream-{}".format(item.stream_id),
-                    )
-                    state.handlers[item.stream_id] = handler
-                    handle._owned_tasks.append(handler)
-                    handle._runtime.fork(handler)
-                state.wake_writer()
+                if primary_error is not None:
+                    break
         except Exception as exc:
             primary_error = exc
         except BaseException as exc:
@@ -764,11 +779,7 @@ class SmallServer:
                     payload = state.protocol.close()
                     if payload:
                         await handle._transport.send_all(task, client, payload)
-                    if not handle._transport.close_safely(client):
-                        error = client.close_error or RuntimeError(
-                            "kernel connection close failed"
-                        )
-                        handle._connection_close_failed(error, task)
+                    handle._force_connection_close(client, task)
                     return
                 while not state.closing:
                     payload = state.protocol.flush()
@@ -778,12 +789,7 @@ class SmallServer:
         except Exception as error:
             state.failure = error
             state.closing = True
-            handle._listener_failed(error, task)
-            if not handle._transport.close_safely(client):
-                close_error = client.close_error or RuntimeError(
-                    "kernel connection close failed"
-                )
-                handle._connection_close_failed(close_error, task, error)
+            handle._force_connection_close(client, task, error)
             raise
         finally:
             if task in handle._owned_tasks:
@@ -802,11 +808,7 @@ class SmallServer:
             if client.closed:
                 return
             state.closing = True
-            if not handle._transport.close_safely(client):
-                error = client.close_error or RuntimeError(
-                    "kernel connection close failed"
-                )
-                handle._connection_close_failed(error, task, state.failure)
+            handle._force_connection_close(client, task, state.failure)
         finally:
             if task in handle._owned_tasks:
                 handle._owned_tasks.remove(task)
@@ -868,8 +870,4 @@ class SmallServer:
     ) -> None:
         state.failure = error
         state.closing = True
-        if not handle._transport.close_safely(client):
-            close_error = client.close_error or RuntimeError(
-                "kernel connection close failed"
-            )
-            handle._connection_close_failed(close_error, task, error)
+        handle._force_connection_close(client, task, error)

@@ -22,9 +22,11 @@ else:
 from SmallPackage import SmallOS, Unix
 
 from smallserver import HTTP2Config, Response, SmallServer
+from smallserver._transport import KernelTransport, TransportHandle
 from smallserver.errors import ServerConfigurationError
-from smallserver.http2 import H2Protocol
-from tests.kernel_fakes import FakeKernel
+from smallserver.http2 import H2Protocol, _FrameBudget
+from smallserver.server import ServerConfig, ServerHandle
+from tests.kernel_fakes import FakeKernel, OpaqueHandle
 
 
 class HTTP2OptionalDependencyTests(unittest.TestCase):
@@ -89,6 +91,42 @@ class HTTP2OptionalDependencyTests(unittest.TestCase):
         self.assertFalse(
             any(call[0] == "resolve_passive_address" for call in runtime.kernel.calls)
         )
+
+    def test_h2_force_close_failure_retains_one_owner_until_retry(self):
+        class Runtime:
+            def resume_task(self, task):
+                return None
+
+            def cancel_task(self, task):
+                return None
+
+        kernel = FakeKernel()
+        transport = KernelTransport(kernel)
+        listener = transport.open_listener("127.0.0.1", 0, 2)
+        wakeup = transport.create_wakeup_channel()
+        handle = ServerHandle(Runtime(), transport, listener, wakeup, ServerConfig())
+        raw_client = OpaqueHandle("h2-client")
+        client = TransportHandle(raw_client)
+        reader_task = object()
+        writer_error = RuntimeError("writer failed")
+        handle._connections[id(client)] = (client, reader_task)
+        handle._graceful_connections.add(id(client))
+        handle._graceful_closers[id(client)] = lambda: None
+        kernel.close_failures[id(raw_client)] = 2
+
+        self.assertFalse(
+            handle._force_connection_close(client, object(), writer_error)
+        )
+        self.assertEqual(handle.owned_connection_count, 1)
+        self.assertEqual(len(handle.cleanup_errors), 1)
+        self.assertIs(handle.failure, writer_error)
+
+        handle._finish_close()
+        self.assertFalse(handle.finished)
+        self.assertEqual(handle.owned_connection_count, 1)
+        handle._finish_close()
+        self.assertTrue(handle.finished)
+        self.assertEqual(handle.owned_connection_count, 0)
 
 
 @unittest.skipUnless(H2_AVAILABLE, "install the smallserver[test] HTTP/2 extra")
@@ -159,7 +197,8 @@ class HTTP2ProtocolTests(unittest.TestCase):
             max_body_bytes=4,
             max_connection_buffer_bytes=8,
             max_response_body_bytes=4,
-            max_pending_output_bytes=8,
+            max_pending_output_bytes=32,
+            max_control_output_bytes=16,
         )
         client, server = self._pair(config)
         client.send_headers(
@@ -231,6 +270,23 @@ class HTTP2ProtocolTests(unittest.TestCase):
         self.assertEqual(server.buffered_request_bytes, 4)
         server.queue_response(1, Response.text("done"))
         self.assertEqual(server.buffered_request_bytes, 0)
+
+    def test_completed_body_has_one_retained_payload_object(self):
+        client, server = self._pair()
+        client.send_headers(
+            1,
+            [
+                (":method", "POST"),
+                (":scheme", "http"),
+                (":authority", "localhost"),
+                (":path", "/slow"),
+            ],
+        )
+        client.send_data(1, b"retained", end_stream=True)
+        ready = server.receive_data(client.data_to_send())
+        retained = server._inbound[1].body
+        self.assertIsInstance(retained, bytes)
+        self.assertIs(retained, ready[0].request.body)
 
     def test_bad_stream_metadata_resets_only_that_stream(self):
         client, server = self._pair()
@@ -326,6 +382,40 @@ class HTTP2ProtocolTests(unittest.TestCase):
         self.assertTrue(
             any(isinstance(event, StreamReset) and event.stream_id == 1 for event in events)
         )
+
+    def test_control_output_is_bounded_and_frames_are_processed_in_batches(self):
+        config = HTTP2Config(
+            reader_frame_batch_size=2,
+            max_control_output_bytes=64,
+        )
+        client, server = self._pair(config)
+        for value in range(6):
+            client.ping(value.to_bytes(8, "big"))
+        server.receive_data(client.data_to_send())
+        self.assertTrue(server.has_pending_input)
+        batches = 1
+        while server.has_pending_input:
+            client.receive_data(server.flush())
+            server.receive_data(b"")
+            batches += 1
+        client.receive_data(server.flush())
+        self.assertGreaterEqual(batches, 3)
+        self.assertEqual(server.pending_output_bytes, 0)
+
+        limited_client, limited_server = self._pair(
+            HTTP2Config(max_control_output_bytes=16)
+        )
+        limited_client.ping(b"12345678")
+        with self.assertRaisesRegex(ValueError, "control output"):
+            limited_server.receive_data(limited_client.data_to_send())
+
+    def test_compressed_header_budget_rejects_declared_size_before_payload(self):
+        budget = _FrameBudget(HTTP2Config(max_compressed_header_bytes=4))
+        budget.feed(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+        header = b"\x00\x00\x05" + b"\x01\x04" + b"\x00\x00\x00\x01"
+        with self.assertRaisesRegex(ValueError, "compressed header"):
+            budget.feed(header)
+        self.assertEqual(len(budget._payload), 0)
 
 
 @unittest.skipUnless(H2_AVAILABLE, "install the smallserver[test] HTTP/2 extra")
@@ -464,7 +554,7 @@ class HTTP2ServerIntegrationTests(unittest.TestCase):
         self.assertEqual(bytes(received), body)
         self.assertEqual(server.pending_output_bytes, 0)
 
-    def test_writer_send_failure_is_fatal_and_releases_capacity(self):
+    def test_writer_send_failure_closes_only_client_and_listener_stays_healthy(self):
         runtime = SmallOS().setKernel(Unix())
         app = SmallServer()
 
@@ -479,13 +569,19 @@ class HTTP2ServerIntegrationTests(unittest.TestCase):
         except PermissionError:
             self.skipTest("the current sandbox does not permit loopback TCP binds")
         original_transport = server._transport
+        failure_injected = False
 
         class FailingWriterTransport:
             def __getattr__(self, name):
                 return getattr(original_transport, name)
 
             async def send_all(self, task, stream, data):
-                if getattr(task, "name", "") == "smallserver-http2-writer":
+                nonlocal failure_injected
+                if (
+                    getattr(task, "name", "") == "smallserver-http2-writer"
+                    and not failure_injected
+                ):
+                    failure_injected = True
                     raise RuntimeError("injected HTTP/2 writer failure")
                 await original_transport.send_all(task, stream, data)
 
@@ -494,25 +590,39 @@ class HTTP2ServerIntegrationTests(unittest.TestCase):
 
         def client_work():
             try:
-                client = H2Connection(config=H2Configuration(client_side=True))
-                client.initiate_connection()
-                with socket.create_connection(
-                    ("127.0.0.1", server.port), timeout=3
-                ) as connection:
-                    connection.sendall(client.data_to_send())
-                    client.send_headers(
-                        1,
-                        [
-                            (":method", "GET"),
-                            (":scheme", "http"),
-                            (":authority", "localhost"),
-                            (":path", "/fail"),
-                        ],
-                        end_stream=True,
-                    )
-                    connection.sendall(client.data_to_send())
-                    while connection.recv(65535):
-                        pass
+                responses = []
+                for _attempt in range(2):
+                    client = H2Connection(config=H2Configuration(client_side=True))
+                    client.initiate_connection()
+                    body = bytearray()
+                    with socket.create_connection(
+                        ("127.0.0.1", server.port), timeout=3
+                    ) as connection:
+                        connection.sendall(client.data_to_send())
+                        client.send_headers(
+                            1,
+                            [
+                                (":method", "GET"),
+                                (":scheme", "http"),
+                                (":authority", "localhost"),
+                                (":path", "/fail"),
+                            ],
+                            end_stream=True,
+                        )
+                        connection.sendall(client.data_to_send())
+                        ended = False
+                        while not ended:
+                            data = connection.recv(65535)
+                            if not data:
+                                break
+                            for event in client.receive_data(data):
+                                if isinstance(event, DataReceived):
+                                    body.extend(event.data)
+                                elif isinstance(event, StreamEnded):
+                                    ended = True
+                    responses.append(bytes(body))
+                self.assertEqual(responses, [b"", b"response"])
+                server.close()
             except BaseException as exc:
                 errors.append(exc)
                 try:
@@ -526,8 +636,8 @@ class HTTP2ServerIntegrationTests(unittest.TestCase):
         worker.join(timeout=3)
         self.assertFalse(worker.is_alive())
         self.assertEqual(errors, [])
-        self.assertIsInstance(server.failure, RuntimeError)
-        self.assertIn("writer failure", str(server.failure))
+        self.assertTrue(failure_injected)
+        self.assertIsNone(server.failure)
         self.assertEqual(server.owned_connection_count, 0)
         self.assertTrue(server.finished)
 
