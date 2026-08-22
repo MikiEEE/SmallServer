@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Awaitable, Callable, Iterable
-from typing import Any
+from typing import Any, NoReturn
 
 from ._transport import (
     KernelTransport,
@@ -17,6 +17,15 @@ from .server import HTTPParseError, HTTPRequestParser, ServerConfig, ServerHandl
 
 Handler = Callable[[Request], Awaitable[Response]]
 _METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE"})
+
+
+def _raise_startup_cleanup(
+    primary_error: BaseException, transaction: _CleanupTransaction
+) -> NoReturn:
+    cleanup_error = ServerStartupError(primary_error, transaction)
+    if isinstance(primary_error, (KeyboardInterrupt, SystemExit)):
+        raise primary_error from cleanup_error
+    raise cleanup_error from primary_error
 
 
 class SmallServer:
@@ -86,9 +95,7 @@ class SmallServer:
         try:
             listener = transport.open_listener(host, port, config.max_connections)
         except _TransportAcquisitionFailure as failure:
-            raise ServerStartupError(
-                failure.primary_error, failure.transaction
-            ) from failure.primary_error
+            _raise_startup_cleanup(failure.primary_error, failure.transaction)
         try:
             wakeup = transport.create_wakeup_channel()
         except _TransportAcquisitionFailure as failure:
@@ -98,9 +105,7 @@ class SmallServer:
                 failure.transaction.add(
                     "listener", lambda: transport.close(listener), cleanup_error
                 )
-            raise ServerStartupError(
-                failure.primary_error, failure.transaction
-            ) from failure.primary_error
+            _raise_startup_cleanup(failure.primary_error, failure.transaction)
         except BaseException as primary_error:
             try:
                 transport.close(listener)
@@ -109,9 +114,7 @@ class SmallServer:
                 transaction.add(
                     "listener", lambda: transport.close(listener), cleanup_error
                 )
-                raise ServerStartupError(
-                    primary_error, transaction
-                ) from primary_error
+                _raise_startup_cleanup(primary_error, transaction)
             raise
         handle = ServerHandle(runtime, transport, listener, wakeup, config)
         tasks: tuple[Any, ...] = ()
@@ -191,9 +194,7 @@ class SmallServer:
                         lambda: handle._finish_close(),
                         RuntimeError("server startup cleanup is incomplete"),
                     )
-                raise ServerStartupError(
-                    primary_error, transaction
-                ) from primary_error
+                _raise_startup_cleanup(primary_error, transaction)
             raise
         return handle
 
@@ -220,7 +221,7 @@ class SmallServer:
         accepted_in_batch = 0
         while not handle.closed:
             if handle.owned_connection_count >= handle._config.max_connections:
-                await task.yield_now()
+                await handle._wait_for_capacity(task)
                 continue
             try:
                 accepted = await handle._transport.accept(task, handle._listener)
@@ -231,9 +232,7 @@ class SmallServer:
                 )
                 failure.transaction.transfer()
                 raise failure.primary_error
-            except Exception as exc:
-                if handle.closed:
-                    return
+            except BaseException as exc:
                 handle._listener_failed(exc, task)
                 raise
             client = accepted.stream
@@ -258,20 +257,16 @@ class SmallServer:
                     runtime = handle._runtime
                     runtime.fork(connection_task)
                 except BaseException as registration_error:
-                    handle._connections.pop(id(client), None)
-                    if connection_task is not None:
-                        cancel_task = getattr(handle._runtime, "cancel_task", None)
-                        if callable(cancel_task):
-                            try:
-                                cancel_task(connection_task)
-                            except Exception:
-                                pass
-                    if not handle._close_or_retain(
-                        client, task, registration_error
-                    ):
-                        raise registration_error
-                    if not isinstance(registration_error, Exception):
-                        raise
+                    try:
+                        if connection_task is not None:
+                            handle._cancel_or_retain_task(connection_task)
+                    finally:
+                        handle._connections.pop(id(client), None)
+                        handle._close_or_retain(
+                            client, task, registration_error
+                        )
+                    handle._listener_failed(registration_error, task)
+                    raise
             if accepted_in_batch >= handle._config.accept_batch_size:
                 accepted_in_batch = 0
                 await task.yield_now()

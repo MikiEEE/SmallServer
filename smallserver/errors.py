@@ -3,6 +3,20 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import Any
+
+try:
+    from _thread import allocate_lock
+except ImportError:  # pragma: no cover - runtimes without threads need no lock
+    allocate_lock = None  # type: ignore[assignment]
+
+
+class _NoThreadLock:
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(self, *args: object) -> None:
+        return None
 
 
 class _CleanupTransaction:
@@ -11,6 +25,7 @@ class _CleanupTransaction:
     def __init__(self) -> None:
         self._actions: dict[str, Callable[[], None]] = {}
         self._errors: dict[str, BaseException] = {}
+        self._lock: Any = allocate_lock() if allocate_lock is not None else _NoThreadLock()
 
     def add(
         self,
@@ -18,38 +33,43 @@ class _CleanupTransaction:
         action: Callable[[], None],
         error: BaseException | None = None,
     ) -> None:
-        key = name
-        suffix = 2
-        while key in self._actions:
-            key = "{}:{}".format(name, suffix)
-            suffix += 1
-        self._actions[key] = action
-        if error is not None:
-            self._errors[key] = error
+        with self._lock:
+            key = name
+            suffix = 2
+            while key in self._actions:
+                key = "{}:{}".format(name, suffix)
+                suffix += 1
+            self._actions[key] = action
+            if error is not None:
+                self._errors[key] = error
 
     def retry(self) -> tuple[BaseException, ...]:
-        for name, action in tuple(self._actions.items()):
-            try:
-                action()
-            except BaseException as exc:
-                self._errors[name] = exc
-            else:
-                self._actions.pop(name, None)
-                self._errors.pop(name, None)
-        return self.errors
+        with self._lock:
+            for name, action in tuple(self._actions.items()):
+                try:
+                    action()
+                except BaseException as exc:
+                    self._errors[name] = exc
+                else:
+                    self._actions.pop(name, None)
+                    self._errors.pop(name, None)
+            return tuple(self._errors.values())
 
     def transfer(self) -> None:
         """Drop actions after ownership moves to another framework object."""
-        self._actions.clear()
-        self._errors.clear()
+        with self._lock:
+            self._actions.clear()
+            self._errors.clear()
 
     @property
     def errors(self) -> tuple[BaseException, ...]:
-        return tuple(self._errors.values())
+        with self._lock:
+            return tuple(self._errors.values())
 
     @property
     def complete(self) -> bool:
-        return not self._actions
+        with self._lock:
+            return not self._actions
 
 
 class ServerStartupError(RuntimeError):
@@ -87,6 +107,21 @@ class ServerStartupError(RuntimeError):
     def finalize(self) -> bool:
         """Alias for :meth:`retry_cleanup`."""
         return self.retry_cleanup()
+
+    def __del__(self) -> None:
+        try:
+            if self.cleanup_complete or self.retry_cleanup():
+                return
+            import warnings
+
+            warnings.warn(
+                "abandoned ServerStartupError still owns resources after cleanup retry",
+                ResourceWarning,
+                stacklevel=2,
+            )
+        except BaseException:
+            # Destructors must never interfere with interpreter shutdown.
+            return
 
 
 class HTTPError(Exception):

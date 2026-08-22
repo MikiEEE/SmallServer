@@ -1,7 +1,11 @@
+import gc
+import threading
 import unittest
+import warnings
 from unittest.mock import patch
 
 from smallserver import ServerStartupError, SmallServer
+from smallserver.errors import _CleanupTransaction
 from smallserver.server import HTTPParseError, HTTPRequestParser, ServerConfig
 
 from tests.kernel_fakes import FakeKernel
@@ -201,3 +205,97 @@ class HTTPRequestParserTests(unittest.TestCase):
         self.assertTrue(error.cleanup_complete)
         self.assertEqual(runtime.kernel.closed, [runtime.kernel.listener])
         self.assertEqual(runtime.kernel.wakeup.close_calls, 1)
+
+    def test_interrupt_identity_survives_successful_and_failed_rollback(self) -> None:
+        class Runtime:
+            def __init__(self) -> None:
+                self.kernel = FakeKernel()
+
+        for interrupt in (KeyboardInterrupt("stop"), SystemExit(7)):
+            for close_failures in (0, 1):
+                with self.subTest(
+                    interrupt=type(interrupt).__name__,
+                    close_failures=close_failures,
+                ):
+                    runtime = Runtime()
+                    runtime.kernel.operation_errors["listen"] = interrupt
+                    runtime.kernel.close_failures[id(runtime.kernel.listener)] = (
+                        close_failures
+                    )
+                    with self.assertRaises(type(interrupt)) as raised:
+                        SmallServer().serve(runtime)
+                    self.assertIs(raised.exception, interrupt)
+                    if close_failures:
+                        cleanup = raised.exception.__cause__
+                        self.assertIsInstance(cleanup, ServerStartupError)
+                        assert isinstance(cleanup, ServerStartupError)
+                        self.assertIs(cleanup.primary_error, interrupt)
+                        self.assertTrue(cleanup.retry_cleanup())
+                    else:
+                        self.assertNotIsInstance(
+                            raised.exception.__cause__, ServerStartupError
+                        )
+
+    def test_abandoned_startup_error_retries_and_warns_if_incomplete(self) -> None:
+        transaction = _CleanupTransaction()
+        attempts = []
+
+        def fail_cleanup() -> None:
+            attempts.append(1)
+            raise RuntimeError("still owned")
+
+        transaction.add("listener", fail_cleanup, RuntimeError("first failure"))
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", ResourceWarning)
+            error = ServerStartupError(RuntimeError("startup"), transaction)
+            del error
+            gc.collect()
+
+        self.assertEqual(attempts, [1])
+        self.assertEqual(len(caught), 1)
+        self.assertIs(caught[0].category, ResourceWarning)
+        self.assertNotIn("listener", str(caught[0].message))
+
+    def test_startup_cleanup_retry_is_concurrently_idempotent(self) -> None:
+        transaction = _CleanupTransaction()
+        entered = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        def cleanup() -> None:
+            calls.append(1)
+            entered.set()
+            if not release.wait(2):
+                raise TimeoutError("cleanup test stalled")
+
+        transaction.add("listener", cleanup, RuntimeError("initial failure"))
+        error = ServerStartupError(RuntimeError("startup"), transaction)
+        results = []
+        workers = [
+            threading.Thread(target=lambda: results.append(error.retry_cleanup()))
+            for _ in range(2)
+        ]
+        workers[0].start()
+        self.assertTrue(entered.wait(1))
+        workers[1].start()
+        release.set()
+        for worker in workers:
+            worker.join(2)
+
+        self.assertEqual(calls, [1])
+        self.assertEqual(results, [True, True])
+        self.assertTrue(error.cleanup_complete)
+
+    def test_server_startup_error_public_typing_fixture_compiles(self) -> None:
+        fixture = """
+from smallserver import ServerStartupError
+
+def finish_startup_cleanup(error: ServerStartupError) -> bool:
+    primary: BaseException = error.primary_error
+    pending: tuple[BaseException, ...] = error.cleanup_errors
+    return error.cleanup_complete or error.finalize()
+"""
+        code = compile(fixture, "server_startup_error_typing.py", "exec")
+        namespace = {}
+        exec(code, namespace)
+        self.assertTrue(callable(namespace["finish_startup_cleanup"]))

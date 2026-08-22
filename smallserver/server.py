@@ -119,6 +119,8 @@ class ServerConfig:
 class ServerHandle:
     """A bound listener and its cooperative shutdown signal."""
 
+    _CAPACITY_SIGNAL = 31
+
     def __init__(
         self,
         runtime: Any,
@@ -142,6 +144,8 @@ class ServerHandle:
         self._listener_resumed = False
         self._connections: dict[int, tuple[TransportHandle, Any]] = {}
         self._closing_connections: dict[int, TransportHandle] = {}
+        self._pending_task_cancellations: dict[int, Any] = {}
+        self._capacity_waiting = False
 
     @property
     def address(self) -> tuple[str, int]:
@@ -174,6 +178,29 @@ class ServerHandle:
     def owned_connection_count(self) -> int:
         """Connections still owned, including streams awaiting close retry."""
         return len(self._connections) + len(self._closing_connections)
+
+    async def _wait_for_capacity(self, task: Any) -> None:
+        """Block the listener on a scheduler-native signal until capacity changes."""
+        self._capacity_waiting = True
+        try:
+            await task.wait_signal(self._CAPACITY_SIGNAL)
+        finally:
+            self._capacity_waiting = False
+
+    def _notify_capacity_released(self, previous_count: int) -> None:
+        if (
+            not self._capacity_waiting
+            or previous_count < self._config.max_connections
+            or self.owned_connection_count >= self._config.max_connections
+            or self._listener_task is None
+        ):
+            return
+        accept_signal = getattr(self._listener_task, "acceptSignal", None)
+        try:
+            if not callable(accept_signal) or accept_signal(self._CAPACITY_SIGNAL) != 0:
+                raise RuntimeError("listener capacity signal failed")
+        except BaseException as error:
+            self._listener_failed(error, getattr(self._runtime, "cursor", None))
 
     def close(self) -> None:
         """Request external shutdown through a kernel wakeup channel."""
@@ -212,13 +239,15 @@ class ServerHandle:
         if self._failure is None:
             self._failure = exc
         self._close_requested = True
-        if self._wakeup is not None:
+        if self._wakeup is not None and not self._notification_sent:
             try:
                 self._wakeup.notify()
                 self._notification_sent = True
                 return
             except BaseException:
                 pass
+        elif self._notification_sent:
+            return
         self._finish_close(current_task=task)
 
     def _finish_close(self, current_task: Any = None) -> None:
@@ -246,6 +275,11 @@ class ServerHandle:
                     "kernel connection close failed"
                 )
                 self._cleanup_errors["connection:{}".format(identity)] = error
+
+        for identity, task in list(self._pending_task_cancellations.items()):
+            if self._cancel_or_retain_task(task):
+                self._pending_task_cancellations.pop(identity, None)
+                self._cleanup_errors.pop("task:{}".format(identity), None)
 
         for identity, (connection, task) in list(self._connections.items()):
             if task is not current_task:
@@ -326,6 +360,25 @@ class ServerHandle:
             self._failure = primary_error
         self._connection_close_failed(error, task, primary_error)
 
+    def _cancel_or_retain_task(self, task: Any) -> bool:
+        identity = id(task)
+        cancel_task = getattr(self._runtime, "cancel_task", None)
+        try:
+            if callable(cancel_task):
+                cancel_task(task)
+            else:
+                task_cancel = getattr(task, "cancel", None)
+                if not callable(task_cancel):
+                    raise RuntimeError("runtime cannot cancel a connection task")
+                task_cancel()
+        except BaseException as exc:
+            self._pending_task_cancellations[identity] = task
+            self._cleanup_errors["task:{}".format(identity)] = exc
+            return False
+        self._pending_task_cancellations.pop(identity, None)
+        self._cleanup_errors.pop("task:{}".format(identity), None)
+        return True
+
     def _connection_finished(
         self,
         task: Any,
@@ -333,8 +386,10 @@ class ServerHandle:
         primary_error: BaseException | None = None,
     ) -> None:
         """Release a completed connection without losing failed-close ownership."""
+        previous_count = self.owned_connection_count
         self._connections.pop(id(connection), None)
         self._close_or_retain(connection, task, primary_error)
+        self._notify_capacity_released(previous_count)
         self._update_finished()
 
     def _update_finished(self) -> None:
@@ -345,6 +400,7 @@ class ServerHandle:
             and self._listener.closed
             and not self._connections
             and not self._closing_connections
+            and not self._pending_task_cancellations
         )
         if self._finished:
             self._cleanup_errors.clear()

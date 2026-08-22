@@ -82,13 +82,18 @@ wakeup resource, `serve()` raises `ServerStartupError`. Its `primary_error`
 preserves the startup failure and `cleanup_errors` reports the outstanding
 cleanup attempts without exposing kernel handles. Keep the exception and call
 `retry_cleanup()` (or `finalize()`) until it returns `True`; later calls remain
-safe and return `True`.
+safe and return `True`. `KeyboardInterrupt` and `SystemExit` are always
+re-raised as the identical exception; when rollback is incomplete, their
+`__cause__` is the `ServerStartupError` cleanup owner. Abandoning an incomplete
+startup error performs one best-effort cleanup retry and emits a
+`ResourceWarning` if resources remain owned.
 
 `max_connections` bounds every connection stream still owned by the server,
 including streams retained after a failed close. At capacity the listener
-cooperatively yields without accepting another connection. Any connection
-close failure is fatal and stops further acceptance while retaining the stream
-for an explicit shutdown-cleanup retry.
+blocks on a SmallOS scheduler signal without polling or accepting another
+connection; releasing capacity signals the listener. Any connection close
+failure is fatal and stops further acceptance while retaining the stream for
+an explicit shutdown-cleanup retry.
 
 Each current connection accepts one request and sends a `Connection: close`
 response.
