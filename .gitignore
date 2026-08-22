@@ -1,6 +1,7 @@
 # Local agent plans and generated documentation index.
 docs/
 skills/
+AGENTS.md
 
 # Python build and test output.
 __pycache__/
