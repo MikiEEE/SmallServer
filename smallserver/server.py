@@ -137,10 +137,17 @@ class ServerConfig:
 class ServerHandle:
     """A bound listener and its cooperative shutdown signal."""
 
-    def __init__(self, runtime: Any, listener: socket.socket, config: ServerConfig) -> None:
+    def __init__(
+        self,
+        runtime: Any,
+        listener: socket.socket,
+        config: ServerConfig,
+        route_observer_dispatcher: Any = None,
+    ) -> None:
         self._runtime = runtime
         self._listener = listener
         self._config = config
+        self._route_observer_dispatcher = route_observer_dispatcher
         self._wake_read, self._wake_write = socket.socketpair()
         self._wake_read.setblocking(False)
         self._wake_write.setblocking(False)
@@ -160,6 +167,16 @@ class ServerHandle:
     @property
     def closed(self) -> bool:
         return self._closed
+
+    @property
+    def dropped_route_error_events(self) -> int:
+        dispatcher = self._route_observer_dispatcher
+        return 0 if dispatcher is None else int(dispatcher.dropped)
+
+    @property
+    def route_observer_failures(self) -> int:
+        dispatcher = self._route_observer_dispatcher
+        return 0 if dispatcher is None else int(dispatcher.failures)
 
     def close(self) -> None:
         """Request shutdown safely from any thread without closing live FDs there."""

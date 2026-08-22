@@ -156,11 +156,14 @@ def observe_route_error(event: RouteErrorEvent) -> None:
 app = SmallServer(route_error_observer=observe_route_error)
 ```
 
-The synchronous observer receives a fresh, immutable, traceback-free event
-containing only an opaque route ID and category. It runs once on the connection
-task and should return quickly; observer failures are isolated from the
-response path. A path above the configured regex-routing byte limit returns
-414 before matching begins.
+The observer receives a fresh, immutable, traceback-free event containing only
+an opaque route ID and category. A bounded single-worker dispatcher invokes it
+outside the SmallOS/request call stack and exits when its queue drains. The
+observer should return quickly; failures are isolated from responses, reported
+through `threading.excepthook`, and counted by
+`server.route_observer_failures`. Capacity drops are counted by
+`server.dropped_route_error_events`. A path above the configured regex-routing
+byte limit returns 414 before matching begins.
 
 Requests retain the exact ASCII origin-form target in `request.raw_target`.
 Routing uses `request.path`, which excludes the query string;

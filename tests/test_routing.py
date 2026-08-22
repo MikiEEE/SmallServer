@@ -60,6 +60,28 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(seen[0].route_pattern)
         self.assertEqual(dict(seen[0].path_params), {})
 
+    async def test_static_dispatch_clears_spoofed_route_context(self) -> None:
+        app = SmallServer()
+        seen = []
+
+        @app.get("/health")
+        async def health(request):
+            seen.append(request)
+            return Response()
+
+        dirty = Request(
+            "GET",
+            "/health",
+            Headers(),
+            path_params={"spoofed": "value"},
+            route_pattern="sensitive-spoofed-pattern",
+        )
+        response = await app.dispatch(dirty)
+        self.assertEqual(response.status, 200)
+        self.assertIsNot(seen[0], dirty)
+        self.assertIsNone(seen[0].route_pattern)
+        self.assertEqual(dict(seen[0].path_params), {})
+
     async def test_http_error_becomes_response(self) -> None:
         app = SmallServer()
 
