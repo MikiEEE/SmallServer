@@ -261,7 +261,9 @@ class SmallServer:
         config = self._resolve_server_config(config, managed=managed)
         should_start = managed if start is None else start
         if runtime is None:
-            runtime = _default_runtime_factory(config.managed_runtime)
+            runtime = _default_runtime_factory(
+                config.managed_runtime or ManagedRuntimeConfig()
+            )
         self._validate_runtime(runtime, require_start=should_start)
         handle = self._bind_and_schedule(runtime, host, port, config)
         if not should_start:

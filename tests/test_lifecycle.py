@@ -78,6 +78,16 @@ class ServerLifecycleTests(unittest.TestCase):
         factory.assert_called_once_with(runtime_config)
         self.assertTrue(handle.finished)
 
+    def test_managed_runtime_defaults_are_explicitly_passed_to_smallos(self) -> None:
+        runtime = FakeRuntime()
+        with patch(
+            "smallserver.app._default_runtime_factory", return_value=runtime
+        ) as factory:
+            handle = SmallServer().listen(port=0)
+
+        factory.assert_called_once_with(ManagedRuntimeConfig())
+        self.assertTrue(handle.finished)
+
     def test_default_factory_applies_settings_to_real_smallos_config(self) -> None:
         from smallserver.app import _default_runtime_factory
 
