@@ -21,10 +21,17 @@ class HTTPParseError(Exception):
 class HTTPRequestParser:
     """Incrementally parse one bounded HTTP/1.1 request with Content-Length."""
 
-    def __init__(self, max_header_bytes: int, max_header_count: int, max_body_bytes: int) -> None:
+    def __init__(
+        self,
+        max_header_bytes: int,
+        max_header_count: int,
+        max_body_bytes: int,
+        max_request_target_bytes: int = 8 * 1024,
+    ) -> None:
         self._max_header_bytes = max_header_bytes
         self._max_header_count = max_header_count
         self._max_body_bytes = max_body_bytes
+        self._max_request_target_bytes = max_request_target_bytes
         self._buffer = bytearray()
         self._request_head: tuple[str, str, Headers, int] | None = None
 
@@ -42,13 +49,22 @@ class HTTPRequestParser:
             self._request_head = self._parse_head(bytes(self._buffer[:marker]))
             del self._buffer[:header_length]
 
-        method, path, headers, content_length = self._request_head
+        method, raw_target, headers, content_length = self._request_head
         if len(self._buffer) > content_length:
             raise HTTPParseError(400, "pipelined requests are not supported")
         if len(self._buffer) < content_length:
             return None
         try:
-            return Request(method, path, headers, bytes(self._buffer), "HTTP/1.1")
+            path, separator, query_string = raw_target.partition("?")
+            return Request(
+                method,
+                path,
+                headers,
+                bytes(self._buffer),
+                "HTTP/1.1",
+                raw_target=raw_target,
+                query_string=query_string if separator else "",
+            )
         except ValueError as exc:
             raise HTTPParseError(400, str(exc)) from exc
 
@@ -59,10 +75,12 @@ class HTTPRequestParser:
             raise HTTPParseError(400, "request headers are not valid bytes") from exc
         if not lines or len(lines[0].split(" ")) != 3:
             raise HTTPParseError(400, "malformed request line")
-        method, path, version = lines[0].split(" ")
-        if version != "HTTP/1.1" or not path.startswith("/"):
+        method, raw_target, version = lines[0].split(" ")
+        if version != "HTTP/1.1" or not raw_target.startswith("/"):
             raise HTTPParseError(400, "only origin-form HTTP/1.1 requests are supported")
-        if "#" in path or any(not 0x21 <= ord(character) <= 0x7E for character in path):
+        if len(raw_target.encode("iso-8859-1")) > self._max_request_target_bytes:
+            raise HTTPParseError(414, "request target is too large")
+        if "#" in raw_target or any(not 0x21 <= ord(character) <= 0x7E for character in raw_target):
             raise HTTPParseError(400, "request target is not valid origin-form")
         if len(lines) - 1 > self._max_header_count:
             raise HTTPParseError(413, "too many request headers")
@@ -94,7 +112,7 @@ class HTTPRequestParser:
                 raise HTTPParseError(413, "request body is too large")
         if not headers.get("host"):
             raise HTTPParseError(400, "HTTP/1.1 requests require a Host header")
-        return method, path, headers, length
+        return method, raw_target, headers, length
 
 
 @dataclass(frozen=True)
@@ -105,6 +123,7 @@ class ServerConfig:
     max_header_bytes: int = 16 * 1024
     max_header_count: int = 100
     max_body_bytes: int = 1024 * 1024
+    max_request_target_bytes: int = 8 * 1024
     receive_chunk_bytes: int = 8 * 1024
     listener_priority: int = 1
     connection_priority: int = 2

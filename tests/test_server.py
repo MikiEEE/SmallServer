@@ -35,11 +35,29 @@ class HTTPRequestParserTests(unittest.TestCase):
         with self.assertRaisesRegex(HTTPParseError, "origin-form"):
             self.parser().feed(b"GET /items#fragment HTTP/1.1\r\nHost: localhost\r\n\r\n")
 
+    def test_splits_query_without_decoding_or_normalizing_path(self) -> None:
+        request = self.parser().feed(
+            b"GET /items/a%2Fb?tag=x%20y HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        )
+        self.assertIsNotNone(request)
+        assert request is not None
+        self.assertEqual(request.raw_target, "/items/a%2Fb?tag=x%20y")
+        self.assertEqual(request.path, "/items/a%2Fb")
+        self.assertEqual(request.query_string, "tag=x%20y")
+
+    def test_enforces_request_target_limit_independently(self) -> None:
+        parser = HTTPRequestParser(256, 2, 32, max_request_target_bytes=8)
+        with self.assertRaisesRegex(HTTPParseError, "request target") as raised:
+            parser.feed(b"GET /12345678 HTTP/1.1\r\nHost: x\r\n\r\n")
+        self.assertEqual(raised.exception.status, 414)
+
     def test_config_rejects_unbounded_limits(self) -> None:
         with self.assertRaisesRegex(ValueError, "max_connections"):
             ServerConfig(max_connections=0)
         with self.assertRaisesRegex(ValueError, "max_connections"):
             ServerConfig(max_connections=True)
+        with self.assertRaisesRegex(ValueError, "max_request_target_bytes"):
+            ServerConfig(max_request_target_bytes=0)
 
     def test_serve_closes_bound_socket_when_runtime_fork_fails(self) -> None:
         class Listener:

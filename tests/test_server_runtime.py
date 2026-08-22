@@ -1,3 +1,4 @@
+import importlib.util
 import socket
 import threading
 import unittest
@@ -6,6 +7,9 @@ from SmallPackage import SmallOS, Unix
 from SmallPackage.adapters.threads import ThreadAdapter
 
 from smallserver import AdapterRegistry, Response, SmallServer
+
+
+HAS_REGEX = importlib.util.find_spec("regex") is not None
 
 
 class SmallOSServerIntegrationTests(unittest.TestCase):
@@ -127,3 +131,36 @@ class SmallOSServerIntegrationTests(unittest.TestCase):
             self.assertEqual(errors, [])
             self.assertIn(b"\r\n\r\nfast done", responses["fast"])
             self.assertIn(b"\r\n\r\nslow done", responses["slow"])
+
+    @unittest.skipUnless(HAS_REGEX, "regex-routes extra is not installed")
+    def test_loopback_regex_route_uses_path_without_query(self) -> None:
+        runtime = SmallOS().setKernel(Unix())
+        app = SmallServer()
+
+        @app.get_regex(r"/files/(?P<name>[^/]+)")
+        async def file(request):
+            return Response.text(request.path_params["name"] + "?" + request.query_string)
+
+        try:
+            server = app.serve(runtime, host="127.0.0.1", port=0)
+        except PermissionError:
+            self.skipTest("the current sandbox does not permit loopback TCP binds")
+
+        received = []
+        errors = []
+
+        def client() -> None:
+            try:
+                received.append(self._request(server.port, "/files/a%2Fb?download=1"))
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                server.close()
+
+        worker = threading.Thread(target=client, daemon=True)
+        worker.start()
+        runtime.start()
+        worker.join(timeout=2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertIn(b"\r\n\r\na%2Fb?download=1", b"".join(received))

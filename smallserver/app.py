@@ -4,40 +4,35 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Awaitable, Callable, Iterable
+from dataclasses import replace
 import socket
 from typing import Any
 
 from .errors import HTTPError
 from .http import Request, Response
+from .routing import RegexRouteConfig, Router
 from .server import HTTPParseError, HTTPRequestParser, ServerConfig, ServerHandle
 
 Handler = Callable[[Request], Awaitable[Response]]
-_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE"})
 
 
 class SmallServer:
     """Register static HTTP routes and dispatch requests to async handlers."""
 
-    def __init__(self) -> None:
-        self._routes: dict[tuple[str, str], Handler] = {}
+    def __init__(self, regex_config: RegexRouteConfig | None = None) -> None:
+        self._router = Router(regex_config)
 
     def route(self, path: str, methods: Iterable[str]) -> Callable[[Handler], Handler]:
         if not isinstance(path, str) or not path.startswith("/"):
             raise ValueError("route path must start with '/'")
-        normalized = tuple(dict.fromkeys(method.upper() for method in methods))
-        if not normalized or any(method not in _METHODS for method in normalized):
-            raise ValueError("routes must use one or more supported HTTP methods")
+        if "?" in path or "#" in path:
+            raise ValueError("route path must not contain a query string or fragment")
+        normalized = self._router.normalize_methods(methods)
 
         def register(handler: Handler) -> Handler:
             if not callable(handler):
                 raise TypeError("route handler must be callable")
-            keys = [(method, path) for method in normalized]
-            for method, key_path in keys:
-                key = (method, key_path)
-                if key in self._routes:
-                    raise ValueError("route already registered: {} {}".format(method, path))
-            for key in keys:
-                self._routes[key] = handler
+            self._router.add_static(path, normalized, handler)
             return handler
 
         return register
@@ -56,6 +51,33 @@ class SmallServer:
 
     def delete(self, path: str) -> Callable[[Handler], Handler]:
         return self.route(path, ("DELETE",))
+
+    def route_regex(self, pattern: str, methods: Iterable[str]) -> Callable[[Handler], Handler]:
+        """Register a timeout-bounded full-path regular-expression route."""
+        normalized = self._router.normalize_methods(methods)
+
+        def register(handler: Handler) -> Handler:
+            if not callable(handler):
+                raise TypeError("route handler must be callable")
+            self._router.add_regex(pattern, normalized, handler)
+            return handler
+
+        return register
+
+    def get_regex(self, pattern: str) -> Callable[[Handler], Handler]:
+        return self.route_regex(pattern, ("GET",))
+
+    def post_regex(self, pattern: str) -> Callable[[Handler], Handler]:
+        return self.route_regex(pattern, ("POST",))
+
+    def put_regex(self, pattern: str) -> Callable[[Handler], Handler]:
+        return self.route_regex(pattern, ("PUT",))
+
+    def patch_regex(self, pattern: str) -> Callable[[Handler], Handler]:
+        return self.route_regex(pattern, ("PATCH",))
+
+    def delete_regex(self, pattern: str) -> Callable[[Handler], Handler]:
+        return self.route_regex(pattern, ("DELETE",))
 
     def serve(
         self,
@@ -110,12 +132,13 @@ class SmallServer:
 
     async def dispatch(self, request: Request) -> Response:
         """Run a registered handler or return a deterministic HTTP response."""
-        handler = self._routes.get((request.method.upper(), request.path))
-        if handler is None:
-            allowed = sorted(method for method, path in self._routes if path == request.path)
-            if allowed:
-                return Response.text("method not allowed", status=405, headers={"Allow": ", ".join(allowed)})
+        match = self._router.resolve(request.method, request.path)
+        if match.handler is None:
+            if match.allowed_methods:
+                return Response.text("method not allowed", status=405, headers={"Allow": ", ".join(match.allowed_methods)})
             return Response.text("not found", status=404)
+        handler = match.handler
+        request = replace(request, path_params=match.path_params, route_pattern=match.route_pattern)
         try:
             result = handler(request)
             if not inspect.isawaitable(result):
@@ -169,6 +192,7 @@ class SmallServer:
             handle._config.max_header_bytes,
             handle._config.max_header_count,
             handle._config.max_body_bytes,
+            handle._config.max_request_target_bytes,
         )
         try:
             while not handle.closed:
