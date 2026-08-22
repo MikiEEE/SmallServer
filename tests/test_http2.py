@@ -4,29 +4,30 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from h2.config import H2Configuration
-from h2.connection import H2Connection
-from h2.events import ConnectionTerminated, DataReceived, ResponseReceived, StreamEnded
+try:
+    from h2.config import H2Configuration
+    from h2.connection import H2Connection
+    from h2.events import (
+        ConnectionTerminated,
+        DataReceived,
+        ResponseReceived,
+        StreamEnded,
+        StreamReset,
+    )
+except ImportError:
+    H2_AVAILABLE = False
+else:
+    H2_AVAILABLE = True
 
 from SmallPackage import SmallOS, Unix
 
 from smallserver import HTTP2Config, Response, SmallServer
 from smallserver.errors import ServerConfigurationError
 from smallserver.http2 import H2Protocol
+from tests.kernel_fakes import FakeKernel
 
 
-class HTTP2ProtocolTests(unittest.TestCase):
-    def _pair(self, config=None):
-        client = H2Connection(
-            config=H2Configuration(client_side=True, header_encoding="utf-8")
-        )
-        server = H2Protocol(config)
-        client.initiate_connection()
-        server_bytes = server.initiate()
-        server.receive_data(client.data_to_send())
-        client.receive_data(server_bytes + server.flush())
-        return client, server
-
+class HTTP2OptionalDependencyTests(unittest.TestCase):
     def test_dependency_is_lazy_and_missing_extra_is_actionable(self):
         original = builtins.__import__
 
@@ -38,6 +39,67 @@ class HTTP2ProtocolTests(unittest.TestCase):
         with patch("builtins.__import__", side_effect=reject_h2):
             with self.assertRaisesRegex(ServerConfigurationError, "smallserver\\[http2\\]"):
                 H2Protocol()
+
+    def test_incomplete_extra_is_rejected_during_preflight(self):
+        original = builtins.__import__
+
+        def reject_events(name, *args, **kwargs):
+            if name == "h2.events":
+                raise ImportError("broken events module")
+            return original(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=reject_events):
+            with self.assertRaisesRegex(ServerConfigurationError, "complete hyper-h2"):
+                H2Protocol()
+
+    def test_timeout_configuration_is_finite_and_positive(self):
+        for values in (
+            {"handshake_timeout": 0},
+            {"idle_timeout": -1},
+            {"idle_timeout": True},
+        ):
+            with self.subTest(values=values):
+                with self.assertRaises(ValueError):
+                    HTTP2Config(**values)
+
+    def test_dependency_preflight_happens_before_address_resolution(self):
+        class Runtime:
+            def __init__(self):
+                self.kernel = FakeKernel()
+
+            def fork(self, tasks):
+                return None
+
+            def resume_task(self, task):
+                return None
+
+            def cancel_task(self, task):
+                return None
+
+        runtime = Runtime()
+        with patch(
+            "smallserver.app.require_http2",
+            side_effect=ServerConfigurationError("broken HTTP/2 dependency"),
+        ):
+            with self.assertRaisesRegex(ServerConfigurationError, "broken"):
+                SmallServer().serve(runtime, protocol="http2")
+        self.assertFalse(
+            any(call[0] == "resolve_passive_address" for call in runtime.kernel.calls)
+        )
+
+
+@unittest.skipUnless(H2_AVAILABLE, "install the smallserver[test] HTTP/2 extra")
+class HTTP2ProtocolTests(unittest.TestCase):
+    def _pair(self, config=None):
+        client = H2Connection(
+            config=H2Configuration(client_side=True, header_encoding="utf-8")
+        )
+        server = H2Protocol(config)
+        client.initiate_connection()
+        server_bytes = server.initiate()
+        server.receive_data(client.data_to_send())
+        client.receive_data(server_bytes + server.flush())
+        return client, server
 
     def test_prior_knowledge_request_uses_shared_values_and_response(self):
         client, server = self._pair()
@@ -135,7 +197,135 @@ class HTTP2ProtocolTests(unittest.TestCase):
         self.assertEqual(server.take_cancelled_streams(), (1,))
         self.assertEqual(server.take_cancelled_streams(), ())
 
+    def test_completed_slow_handler_body_remains_in_connection_budget(self):
+        config = HTTP2Config(
+            max_body_bytes=4,
+            max_connection_buffer_bytes=6,
+        )
+        client, server = self._pair(config)
+        for stream_id, body in ((1, b"1234"), (3, b"5678")):
+            client.send_headers(
+                stream_id,
+                [
+                    (":method", "POST"),
+                    (":scheme", "http"),
+                    (":authority", "localhost"),
+                    (":path", "/slow"),
+                    ("content-length", "4"),
+                ],
+            )
+            client.send_data(stream_id, body, end_stream=True)
+            ready = server.receive_data(client.data_to_send())
+            if stream_id == 1:
+                self.assertEqual([item.stream_id for item in ready], [1])
+                self.assertEqual(server.buffered_request_bytes, 4)
+            else:
+                self.assertEqual(ready, ())
+        events = client.receive_data(server.flush())
+        self.assertTrue(
+            any(isinstance(event, StreamReset) and event.stream_id == 3 for event in events)
+        )
+        self.assertEqual(server.buffered_request_bytes, 4)
+        server.queue_response(1, Response.text("done"))
+        self.assertEqual(server.buffered_request_bytes, 0)
 
+    def test_bad_stream_metadata_resets_only_that_stream(self):
+        client, server = self._pair()
+        client.send_headers(
+            1,
+            [
+                (":method", "POST"),
+                (":scheme", "http"),
+                (":authority", "localhost"),
+                (":path", "/bad"),
+                ("content-length", "2"),
+            ],
+        )
+        client.send_data(1, b"x", end_stream=True)
+        client.send_headers(
+            3,
+            [
+                (":method", "GET"),
+                (":scheme", "http"),
+                (":authority", "localhost"),
+                (":path", "/good"),
+            ],
+            end_stream=True,
+        )
+        ready = server.receive_data(client.data_to_send())
+        self.assertEqual([item.stream_id for item in ready], [3])
+        events = client.receive_data(server.flush())
+        self.assertTrue(
+            any(isinstance(event, StreamReset) and event.stream_id == 1 for event in events)
+        )
+
+    def test_invalid_method_and_origin_form_are_stream_errors(self):
+        client, server = self._pair()
+        client.config.validate_outbound_headers = False
+        for stream_id, method, path in (
+            (1, "BAD METHOD", "/bad"),
+            (3, "GET", "/bad#fragment"),
+        ):
+            client.send_headers(
+                stream_id,
+                [
+                    (":method", method),
+                    (":scheme", "http"),
+                    (":authority", "localhost"),
+                    (":path", path),
+                ],
+                end_stream=True,
+            )
+        client.send_headers(
+            5,
+            [
+                (":method", "GET"),
+                (":scheme", "http"),
+                (":authority", "localhost"),
+                (":path", "/good"),
+            ],
+            end_stream=True,
+        )
+        ready = server.receive_data(client.data_to_send())
+        self.assertEqual([item.stream_id for item in ready], [5])
+        events = client.receive_data(server.flush())
+        self.assertEqual(
+            {event.stream_id for event in events if isinstance(event, StreamReset)},
+            {1, 3},
+        )
+
+    def test_invalid_content_length_is_a_stream_error(self):
+        client, server = self._pair()
+        client.send_headers(
+            1,
+            [
+                (":method", "POST"),
+                (":scheme", "http"),
+                (":authority", "localhost"),
+                (":path", "/bad"),
+                ("content-length", "-1"),
+            ],
+            end_stream=True,
+        )
+        client.send_headers(
+            3,
+            [
+                (":method", "GET"),
+                (":scheme", "http"),
+                (":authority", "localhost"),
+                (":path", "/good"),
+            ],
+            end_stream=True,
+        )
+        ready = server.receive_data(client.data_to_send())
+        self.assertEqual([item.stream_id for item in ready], [3])
+        events = client.receive_data(server.flush())
+        self.assertTrue(
+            any(isinstance(event, StreamReset) and event.stream_id == 1 for event in events)
+        )
+
+
+@unittest.skipUnless(H2_AVAILABLE, "install the smallserver[test] HTTP/2 extra")
 class HTTP2ServerIntegrationTests(unittest.TestCase):
     _pair = HTTP2ProtocolTests._pair
 
@@ -270,6 +460,258 @@ class HTTP2ServerIntegrationTests(unittest.TestCase):
         self.assertTrue(ended)
         self.assertEqual(bytes(received), body)
         self.assertEqual(server.pending_output_bytes, 0)
+
+    def test_writer_send_failure_is_fatal_and_releases_capacity(self):
+        runtime = SmallOS().setKernel(Unix())
+        app = SmallServer()
+
+        @app.get("/fail")
+        async def fail(request):
+            return Response.text("response")
+
+        try:
+            server = app.serve(
+                runtime, host="127.0.0.1", port=0, protocol="http2"
+            )
+        except PermissionError:
+            self.skipTest("the current sandbox does not permit loopback TCP binds")
+        original_transport = server._transport
+
+        class FailingWriterTransport:
+            def __getattr__(self, name):
+                return getattr(original_transport, name)
+
+            async def send_all(self, task, stream, data):
+                if getattr(task, "name", "") == "smallserver-http2-writer":
+                    raise RuntimeError("injected HTTP/2 writer failure")
+                await original_transport.send_all(task, stream, data)
+
+        server._transport = FailingWriterTransport()
+        errors = []
+
+        def client_work():
+            try:
+                client = H2Connection(config=H2Configuration(client_side=True))
+                client.initiate_connection()
+                with socket.create_connection(
+                    ("127.0.0.1", server.port), timeout=3
+                ) as connection:
+                    connection.sendall(client.data_to_send())
+                    client.send_headers(
+                        1,
+                        [
+                            (":method", "GET"),
+                            (":scheme", "http"),
+                            (":authority", "localhost"),
+                            (":path", "/fail"),
+                        ],
+                        end_stream=True,
+                    )
+                    connection.sendall(client.data_to_send())
+                    while connection.recv(65535):
+                        pass
+            except BaseException as exc:
+                errors.append(exc)
+                try:
+                    server.close()
+                except BaseException:
+                    pass
+
+        worker = threading.Thread(target=client_work, daemon=True)
+        worker.start()
+        runtime.start()
+        worker.join(timeout=3)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertIsInstance(server.failure, RuntimeError)
+        self.assertIn("writer failure", str(server.failure))
+        self.assertEqual(server.owned_connection_count, 0)
+        self.assertTrue(server.finished)
+
+    def test_shutdown_force_closes_a_blocked_writer(self):
+        runtime = SmallOS().setKernel(Unix())
+        app = SmallServer()
+
+        @app.get("/blocked")
+        async def blocked(request):
+            return Response.text("response")
+
+        try:
+            server = app.serve(
+                runtime, host="127.0.0.1", port=0, protocol="http2"
+            )
+        except PermissionError:
+            self.skipTest("the current sandbox does not permit loopback TCP binds")
+        original_transport = server._transport
+        writer_blocked = threading.Event()
+
+        class BlockingWriterTransport:
+            def __getattr__(self, name):
+                return getattr(original_transport, name)
+
+            async def send_all(self, task, stream, data):
+                if getattr(task, "name", "") == "smallserver-http2-writer":
+                    writer_blocked.set()
+                    await task.wait_signal(28)
+                    return
+                await original_transport.send_all(task, stream, data)
+
+        server._transport = BlockingWriterTransport()
+        errors = []
+
+        def client_work():
+            try:
+                client = H2Connection(config=H2Configuration(client_side=True))
+                client.initiate_connection()
+                with socket.create_connection(
+                    ("127.0.0.1", server.port), timeout=3
+                ) as connection:
+                    connection.sendall(client.data_to_send())
+                    client.send_headers(
+                        1,
+                        [
+                            (":method", "GET"),
+                            (":scheme", "http"),
+                            (":authority", "localhost"),
+                            (":path", "/blocked"),
+                        ],
+                        end_stream=True,
+                    )
+                    connection.sendall(client.data_to_send())
+                    if not writer_blocked.wait(2):
+                        raise TimeoutError("writer did not enter its blocked wait")
+                    server.close()
+                    while connection.recv(65535):
+                        pass
+            except BaseException as exc:
+                errors.append(exc)
+                try:
+                    server.close()
+                except BaseException:
+                    pass
+
+        worker = threading.Thread(target=client_work, daemon=True)
+        worker.start()
+        runtime.start()
+        worker.join(timeout=3)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(server.finished)
+        self.assertEqual(server.owned_connection_count, 0)
+
+    def test_protocol_construction_failure_releases_accepted_connection(self):
+        runtime = SmallOS().setKernel(Unix())
+        app = SmallServer()
+        try:
+            with patch(
+                "smallserver.app.H2Protocol",
+                side_effect=RuntimeError("injected constructor failure"),
+            ):
+                server = app.serve(
+                    runtime, host="127.0.0.1", port=0, protocol="http2"
+                )
+
+                def client_work():
+                    with socket.create_connection(
+                        ("127.0.0.1", server.port), timeout=3
+                    ) as connection:
+                        while connection.recv(1024):
+                            pass
+                    server.close()
+
+                worker = threading.Thread(target=client_work, daemon=True)
+                worker.start()
+                runtime.start()
+                worker.join(timeout=3)
+        except PermissionError:
+            self.skipTest("the current sandbox does not permit loopback TCP binds")
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(server.finished)
+        self.assertEqual(server.owned_connection_count, 0)
+
+    def test_handshake_timeout_closes_silent_client_and_releases_capacity(self):
+        runtime = SmallOS().setKernel(Unix())
+        app = SmallServer()
+        try:
+            server = app.serve(
+                runtime,
+                host="127.0.0.1",
+                port=0,
+                protocol="http2",
+                http2_config=HTTP2Config(handshake_timeout=0.01),
+            )
+        except PermissionError:
+            self.skipTest("the current sandbox does not permit loopback TCP binds")
+        errors = []
+
+        def client_work():
+            try:
+                with socket.create_connection(
+                    ("127.0.0.1", server.port), timeout=3
+                ) as connection:
+                    while connection.recv(1024):
+                        pass
+                server.close()
+            except BaseException as exc:
+                errors.append(exc)
+                try:
+                    server.close()
+                except BaseException:
+                    pass
+
+        worker = threading.Thread(target=client_work, daemon=True)
+        worker.start()
+        runtime.start()
+        worker.join(timeout=3)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(server.owned_connection_count, 0)
+        self.assertTrue(server.finished)
+
+    def test_idle_timeout_closes_prefaced_client_and_releases_capacity(self):
+        runtime = SmallOS().setKernel(Unix())
+        app = SmallServer()
+        try:
+            server = app.serve(
+                runtime,
+                host="127.0.0.1",
+                port=0,
+                protocol="http2",
+                http2_config=HTTP2Config(
+                    handshake_timeout=1,
+                    idle_timeout=0.01,
+                ),
+            )
+        except PermissionError:
+            self.skipTest("the current sandbox does not permit loopback TCP binds")
+        errors = []
+
+        def client_work():
+            try:
+                client = H2Connection(config=H2Configuration(client_side=True))
+                client.initiate_connection()
+                with socket.create_connection(
+                    ("127.0.0.1", server.port), timeout=3
+                ) as connection:
+                    connection.sendall(client.data_to_send())
+                    while connection.recv(1024):
+                        pass
+                server.close()
+            except BaseException as exc:
+                errors.append(exc)
+                try:
+                    server.close()
+                except BaseException:
+                    pass
+
+        worker = threading.Thread(target=client_work, daemon=True)
+        worker.start()
+        runtime.start()
+        worker.join(timeout=3)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(server.owned_connection_count, 0)
+        self.assertTrue(server.finished)
 
 
 if __name__ == "__main__":
