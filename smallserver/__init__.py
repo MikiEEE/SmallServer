@@ -19,6 +19,15 @@ from .routing import (
 )
 from .runtime import ManagedRuntimeConfig
 from .server import ServerConfig, ServerHandle
+from .websocket import (
+    WebSocket,
+    WebSocketCapacityError,
+    WebSocketConfig,
+    WebSocketDisconnect,
+    WebSocketMessage,
+    WebSocketStateError,
+    WebSocketUnavailable,
+)
 
 if TYPE_CHECKING:
     from .adapters import AdapterRegistry, AdapterShutdownError, http_error_from_adapter
@@ -39,9 +48,9 @@ __all__ = [
     "AdapterShutdownError",
     "Headers",
     "HTTPError",
+    "ManagedRuntimeConfig",
     "RegexRouteConfig",
     "RegexRoutesUnavailable",
-    "ManagedRuntimeConfig",
     "Request",
     "Response",
     "RouteErrorEvent",
@@ -53,5 +62,12 @@ __all__ = [
     "ServerHandle",
     "ServerStartupError",
     "SmallServer",
+    "WebSocket",
+    "WebSocketCapacityError",
+    "WebSocketConfig",
+    "WebSocketDisconnect",
+    "WebSocketMessage",
+    "WebSocketStateError",
+    "WebSocketUnavailable",
     "http_error_from_adapter",
 ]
