@@ -8,16 +8,16 @@ import sqlite3
 import threading
 
 from SmallPackage import SmallOS, SmallTask, Unix
-from SmallPackage.adapters.asyncio_loop import AsyncioAdapter
-from SmallPackage.adapters.errors import AdapterError
-from SmallPackage.adapters.threads import ThreadAdapter
 
 from smallserver import (
+    AdapterError,
     AdapterRegistry,
+    AsyncioAdapter,
     Headers,
     Request,
     Response,
     SmallServer,
+    ThreadAdapter,
     http_error_from_adapter,
 )
 

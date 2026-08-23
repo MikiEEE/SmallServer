@@ -84,6 +84,14 @@ See [WebSockets](websockets.md) for handshake and completion semantics.
 
 ## Adapters
 
+### `ThreadAdapter(max_workers=None, max_pending=64, ...)`
+
+Bounded worker-thread execution for synchronous or thread-affine callables.
+
+### `AsyncioAdapter(max_pending=64, ...)`
+
+Bounded coroutine execution on one persistent asyncio loop thread.
+
 ### `AdapterRegistry(**adapters)`
 
 Methods: `register`, `get`, `call`, `names`, `items`, and `shutdown`. It also
@@ -92,6 +100,11 @@ implements a context manager and exposes `closed`.
 ### `http_error_from_adapter(exc)`
 
 Convert a SmallOS `AdapterError` to a sanitized `HTTPError`.
+
+Applications can import `AdapterError`, `AdapterCapacityError`,
+`AdapterUnavailableError`, `AdapterClosedError`, `AdapterCancelledError`,
+`AdapterProtocolError`, and `AdapterExecutionError` directly from
+`smallserver`.
 
 ### `AdapterShutdownError`
 

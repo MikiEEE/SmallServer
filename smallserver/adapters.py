@@ -1,4 +1,4 @@
-"""Explicit lifecycle and HTTP translation helpers for SmallOS adapters."""
+"""SmallServer's public facade for SmallOS execution adapters."""
 
 from __future__ import annotations
 
@@ -6,15 +6,35 @@ from collections.abc import Callable, Iterator
 from types import TracebackType
 from typing import Any
 
+from SmallPackage.adapters.asyncio_loop import AsyncioAdapter
 from SmallPackage.adapters.errors import (
     AdapterCancelledError,
     AdapterCapacityError,
     AdapterClosedError,
     AdapterError,
+    AdapterExecutionError,
+    AdapterProtocolError,
     AdapterUnavailableError,
 )
+from SmallPackage.adapters.threads import ThreadAdapter
 
 from .errors import HTTPError
+
+
+__all__ = [
+    "AdapterCancelledError",
+    "AdapterCapacityError",
+    "AdapterClosedError",
+    "AdapterError",
+    "AdapterExecutionError",
+    "AdapterProtocolError",
+    "AdapterRegistry",
+    "AdapterShutdownError",
+    "AdapterUnavailableError",
+    "AsyncioAdapter",
+    "ThreadAdapter",
+    "http_error_from_adapter",
+]
 
 
 class AdapterShutdownError(RuntimeError):
