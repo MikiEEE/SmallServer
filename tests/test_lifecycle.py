@@ -13,6 +13,8 @@ import warnings
 from unittest.mock import patch
 
 from smallserver import (
+    ManagedRuntimeConfig,
+    ServerConfig,
     ServerConfigurationError,
     ServerFinalizationError,
     ServerStartupError,
@@ -57,6 +59,92 @@ class FakeRuntime:
 
 
 class ServerLifecycleTests(unittest.TestCase):
+    def test_managed_runtime_settings_are_passed_to_the_factory(self) -> None:
+        runtime = FakeRuntime()
+        runtime_config = ManagedRuntimeConfig(
+            task_capacity=256,
+            priority_levels=5,
+            io_buffer_length=64,
+            eternal_watchers=True,
+            client_defaults={"http": {"max_response_size": 2048}},
+        )
+        server_config = ServerConfig(managed_runtime=runtime_config)
+
+        with patch(
+            "smallserver.app._default_runtime_factory", return_value=runtime
+        ) as factory:
+            handle = SmallServer().listen(config=server_config, port=0)
+
+        factory.assert_called_once_with(runtime_config)
+        self.assertTrue(handle.finished)
+
+    def test_managed_runtime_defaults_are_explicitly_passed_to_smallos(self) -> None:
+        runtime = FakeRuntime()
+        with patch(
+            "smallserver.app._default_runtime_factory", return_value=runtime
+        ) as factory:
+            handle = SmallServer().listen(port=0)
+
+        factory.assert_called_once_with(ManagedRuntimeConfig())
+        self.assertTrue(handle.finished)
+
+    def test_default_factory_applies_settings_to_real_smallos_config(self) -> None:
+        from smallserver.app import _default_runtime_factory
+
+        config = ManagedRuntimeConfig(
+            task_capacity=33,
+            priority_levels=6,
+            io_buffer_length=17,
+            eternal_watchers=True,
+            client_defaults={"http": {"max_response_size": 8192}},
+        )
+        runtime = _default_runtime_factory(config)
+
+        self.assertEqual(runtime.config.task_capacity, 33)
+        self.assertEqual(runtime.config.priority_levels, 6)
+        self.assertEqual(runtime.config.io_buffer_length, 17)
+        self.assertTrue(runtime.config.eternal_watchers)
+        self.assertEqual(
+            runtime.config.client_defaults_for("http")["max_response_size"], 8192
+        )
+
+    def test_caller_owned_runtime_rejects_managed_runtime_settings_pre_bind(self) -> None:
+        runtime = FakeRuntime()
+        server_config = ServerConfig(managed_runtime=ManagedRuntimeConfig())
+
+        with self.assertRaisesRegex(ValueError, "caller-supplied SmallOS"):
+            SmallServer().listen(runtime=runtime, config=server_config, port=0)
+        with self.assertRaisesRegex(ValueError, "caller-supplied SmallOS"):
+            SmallServer().serve(runtime, config=server_config, port=0)
+
+        self.assertEqual(runtime.kernel.calls, [])
+        self.assertEqual(runtime.forked, [])
+
+    def test_managed_priorities_are_validated_before_runtime_creation(self) -> None:
+        config = ServerConfig(
+            connection_priority=3,
+            managed_runtime=ManagedRuntimeConfig(priority_levels=3),
+        )
+        with patch("smallserver.app._default_runtime_factory") as factory:
+            with self.assertRaisesRegex(ValueError, "priority_levels"):
+                SmallServer().listen(config=config, port=0)
+        factory.assert_not_called()
+
+        insufficient = ServerConfig(
+            max_connections=32,
+            managed_runtime=ManagedRuntimeConfig(task_capacity=33),
+        )
+        with patch("smallserver.app._default_runtime_factory") as factory:
+            with self.assertRaisesRegex(ValueError, r"max_connections \+ 2"):
+                SmallServer().listen(config=insufficient, port=0)
+        factory.assert_not_called()
+
+        implicit_defaults = ServerConfig(max_connections=1023)
+        with patch("smallserver.app._default_runtime_factory") as factory:
+            with self.assertRaisesRegex(ValueError, r"max_connections \+ 2"):
+                SmallServer().listen(config=implicit_defaults, port=0)
+        factory.assert_not_called()
+
     def test_primary_demo_hides_runtime_and_registers_all_http_methods(self) -> None:
         root = Path(__file__).parents[1]
         demo_path = root / "demo.py"

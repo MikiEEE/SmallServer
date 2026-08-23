@@ -17,6 +17,7 @@ from .routing import (
     RouteMatchTimeout,
     RoutePathTooLarge,
 )
+from .runtime import ManagedRuntimeConfig
 from .server import ServerConfig, ServerHandle
 from .websocket import (
     WebSocket,
@@ -47,6 +48,7 @@ __all__ = [
     "AdapterShutdownError",
     "Headers",
     "HTTPError",
+    "ManagedRuntimeConfig",
     "RegexRouteConfig",
     "RegexRoutesUnavailable",
     "Request",
