@@ -48,3 +48,7 @@ Only named captures are exposed, as an immutable mapping. Patterns, paths,
 route counts, captures, individual matches, and total matching time are
 bounded by `RegexRouteConfig`. This is an explicit regex API, not automatic
 `/items/{id}` template parsing or percent decoding.
+
+WebSocket Upgrade routes are registered separately with `app.websocket()`.
+They are exact-path HTTP/1.1 routes and may coexist with an ordinary `GET` at
+the same path. See [WebSockets](websockets.md).

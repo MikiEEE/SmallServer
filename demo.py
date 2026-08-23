@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from smallserver import HTTPError, Request, Response, SmallServer
+from smallserver import HTTPError, Request, Response, SmallServer, WebSocket
 
 
 app = SmallServer()
@@ -79,6 +79,16 @@ async def delete_task(request: Request) -> Response:
         raise HTTPError(404, "task not found")
     del tasks[task_id]
     return Response(status=204)
+
+
+@app.websocket("/ws")
+async def websocket_echo(socket: WebSocket) -> None:
+    await socket.accept()
+    async for message in socket:
+        if message.is_text:
+            await socket.send_text(message.text)
+        else:
+            await socket.send_bytes(message.bytes)
 
 
 if __name__ == "__main__":

@@ -181,7 +181,11 @@ class ServerLifecycleTests(unittest.TestCase):
         import demo
 
         self.assertEqual(
-            {method for method, path in demo.app._routes if path == "/tasks"},
+            {
+                method
+                for method, path in demo.app._router._static
+                if path == "/tasks"
+            },
             {"GET", "POST", "PUT", "PATCH", "DELETE"},
         )
 

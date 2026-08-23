@@ -12,6 +12,7 @@ GUIDE_FILES = {
     "runtime-lifecycle.md",
     "configuration.md",
     "http2.md",
+    "websockets.md",
     "adapters.md",
     "errors-observability.md",
     "platforms-kernels.md",

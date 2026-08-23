@@ -1,8 +1,9 @@
 # Protocol and feature roadmap
 
 This guide documents bounded HTTP/1.1, optional cleartext prior-knowledge
-HTTP/2, exact and optional regex routes, shared HTTP values, explicit SmallOS lifecycle
-control, and application-owned execution adapters.
+HTTP/2, RFC 6455 WebSockets, exact and optional regex routes, shared HTTP
+values, explicit SmallOS lifecycle control, and application-owned execution
+adapters.
 
 Feature branches extend this foundation independently. Until such a branch is
 merged into the branch you install, its API is not available.
@@ -15,10 +16,10 @@ precedence. It does not provide automatic path templates or decoding.
 
 ## WebSocket server
 
-The WebSocket feature is planned as optional RFC 6455 server support over an
-HTTP/1.1 Upgrade, using SmallOS-native transport ownership and bounded
-protocol state. TLS, compression, and RFC 8441 WebSockets over HTTP/2 remain
-separate concerns. No WebSocket API is exported by this base.
+Optional RFC 6455 server support is available over HTTP/1.1 Upgrade using
+SmallOS-native transport ownership and bounded protocol state. See
+[WebSockets](websockets.md). TLS, compression, and RFC 8441 WebSockets over
+HTTP/2 remain separate concerns.
 
 ## HTTP/2 server
 
