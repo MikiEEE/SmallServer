@@ -42,6 +42,11 @@ provide common construction and serialization paths.
 
 Frozen finite-limit configuration. See [Configuration](configuration.md).
 
+### `ManagedRuntimeConfig(...)`
+
+Frozen SmallOS settings used only when `listen()` creates the runtime. A
+caller-supplied runtime retains its own configuration.
+
 ### `HTTP2Config(...)`
 
 Optional cleartext HTTP/2 stream, buffer, frame-batch, and timeout limits. See

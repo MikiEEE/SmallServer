@@ -4,7 +4,7 @@ Pass a `ServerConfig` to `listen()` or `serve()` to tune finite listener,
 parser, and scheduling limits.
 
 ```python
-from smallserver import ServerConfig, SmallServer
+from smallserver import ManagedRuntimeConfig, ServerConfig, SmallServer
 
 app = SmallServer()
 config = ServerConfig(
@@ -18,6 +18,7 @@ config = ServerConfig(
     accept_batch_size=16,
     max_request_target_bytes=8 * 1024,
     max_route_error_events=16,
+    managed_runtime=ManagedRuntimeConfig(task_capacity=256),
 )
 ```
 
@@ -33,10 +34,12 @@ config = ServerConfig(
 | `accept_batch_size` | 16 | Accepts before the listener explicitly yields. |
 | `max_request_target_bytes` | 8 KiB | Maximum HTTP/1.1 origin-form request target. |
 | `max_route_error_events` | 16 | Bounded sanitized regex-timeout observer queue. |
+| `managed_runtime` | `None` | Optional SmallOS settings used only when `listen()` creates the runtime. |
 
-Every field must be a positive integer; booleans are rejected. The public port
-must be an integer from 0 through 65535. `port=0` delegates port selection to
-the kernel.
+Every numeric `ServerConfig` field must be a positive integer; booleans are
+rejected. `managed_runtime` must be `None` or a `ManagedRuntimeConfig`. The
+public port must be an integer from 0 through 65535. `port=0` delegates port
+selection to the kernel.
 
 At connection capacity, the listener waits on a scheduler signal instead of
 accepting and discarding more streams. Connections whose close failed still
@@ -46,6 +49,21 @@ failure is fatal to further acceptance and remains visible for cleanup retry.
 Limits are per `ServerHandle`. They bound HTTP input and framework-owned
 connections, but they do not limit memory allocated by your handlers, response
 bodies, adapter queues, or downstream libraries; configure those separately.
+
+## Managed runtime configuration
+
+`ManagedRuntimeConfig` controls the SmallOS instance created by blocking
+`app.listen()` when no runtime is supplied. It exposes `task_capacity`,
+`priority_levels`, `io_buffer_length`, `eternal_watchers`, and immutable
+per-client `client_defaults`. Caller-owned runtimes must be configured directly;
+SmallServer rejects `ServerConfig(managed_runtime=...)` when `runtime=` is
+provided.
+
+The managed task capacity must cover `max_connections + 2` for HTTP/1.1's
+listener and shutdown-control tasks. Configuring `route_error_observer` adds
+one dedicated task, raising that floor to `max_connections + 3`. HTTP/2 also
+creates bounded connection-control and stream-handler tasks, so configure
+additional capacity from the selected `HTTP2Config` concurrency limits.
 
 ## HTTP/2 configuration
 
