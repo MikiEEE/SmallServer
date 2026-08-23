@@ -25,6 +25,7 @@ from .errors import (
     _CleanupTransaction,
 )
 from .http import Request, Response
+from .http2 import HTTP2Config, H2Protocol, require_http2
 from .routing import (
     RegexRouteConfig,
     RouteErrorEvent,
@@ -56,6 +57,40 @@ from .websocket import (
 Handler = Callable[[Request], Awaitable[Response]]
 WebSocketHandler = Callable[[WebSocket], Awaitable[None]]
 RouteErrorObserver = Callable[[RouteErrorEvent], None]
+_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE"})
+_HTTP2_WRITER_SIGNAL = 30
+_HTTP2_SHUTDOWN_SIGNAL = 29
+
+
+class _H2ConnectionState:
+    def __init__(self, protocol: H2Protocol) -> None:
+        self.protocol = protocol
+        self.writer_task: Any = None
+        self.shutdown_task: Any = None
+        self.watchdog_task: Any = None
+        self.handlers: dict[int, Any] = {}
+        self.closing = False
+        self.shutdown_requested = False
+        self.close_error_code = 0
+        self.activity_epoch = 0
+        self.failure: BaseException | None = None
+
+    def wake_writer(self) -> None:
+        writer = self.writer_task
+        if writer is not None and not getattr(writer, "done", False):
+            if writer.acceptSignal(_HTTP2_WRITER_SIGNAL) != 0:
+                raise RuntimeError("HTTP/2 writer signal failed")
+
+    def request_shutdown(self) -> None:
+        self.shutdown_requested = True
+        self.wake_writer()
+        shutdown_task = self.shutdown_task
+        if shutdown_task is not None and not getattr(shutdown_task, "done", False):
+            if shutdown_task.acceptSignal(_HTTP2_SHUTDOWN_SIGNAL) != 0:
+                raise RuntimeError("HTTP/2 shutdown signal failed")
+
+    def mark_activity(self) -> None:
+        self.activity_epoch += 1
 
 
 class _NoThreadLock:
@@ -160,6 +195,8 @@ class SmallServer:
         if route_error_observer is not None and not callable(route_error_observer):
             raise TypeError("route_error_observer must be callable or None")
         self._router = Router(regex_config)
+        # Preserve the original private static-route map for existing tooling
+        # while the Router owns all registration and lookup behavior.
         self._routes = self._router._static
         self._route_error_observer = route_error_observer
         if websocket_config is not None and not isinstance(
@@ -299,6 +336,9 @@ class SmallServer:
         host: str = "127.0.0.1",
         port: int = 8000,
         config: ServerConfig | None = None,
+        *,
+        protocol: str = "http1",
+        http2_config: HTTP2Config | None = None,
     ) -> ServerHandle:
         """Bind a TCP listener and schedule SmallOS listener/control tasks.
 
@@ -309,7 +349,9 @@ class SmallServer:
         """
         config = self._resolve_server_config(config, managed=False)
         self._validate_runtime(runtime, require_start=False)
-        return self._bind_and_schedule(runtime, host, port, config)
+        return self._bind_and_schedule(
+            runtime, host, port, config, protocol, http2_config
+        )
 
     @overload
     def listen(
@@ -318,6 +360,8 @@ class SmallServer:
         port: int = 8000,
         config: ServerConfig | None = None,
         *,
+        protocol: str = "http1",
+        http2_config: HTTP2Config | None = None,
         runtime: None = None,
         start: Literal[True] | None = None,
     ) -> ServerHandle: ...
@@ -329,6 +373,8 @@ class SmallServer:
         port: int = 8000,
         config: ServerConfig | None = None,
         *,
+        protocol: str = "http1",
+        http2_config: HTTP2Config | None = None,
         runtime: _RuntimeLike,
         start: Literal[False] | None = None,
     ) -> ServerHandle: ...
@@ -340,6 +386,8 @@ class SmallServer:
         port: int = 8000,
         config: ServerConfig | None = None,
         *,
+        protocol: str = "http1",
+        http2_config: HTTP2Config | None = None,
         runtime: _StartableRuntime,
         start: bool,
     ) -> ServerHandle: ...
@@ -350,6 +398,8 @@ class SmallServer:
         port: int = 8000,
         config: ServerConfig | None = None,
         *,
+        protocol: str = "http1",
+        http2_config: HTTP2Config | None = None,
         runtime: _RuntimeLike | None = None,
         start: bool | None = None,
     ) -> ServerHandle:
@@ -371,7 +421,9 @@ class SmallServer:
                 config.managed_runtime or ManagedRuntimeConfig()
             )
         self._validate_runtime(runtime, require_start=should_start)
-        handle = self._bind_and_schedule(runtime, host, port, config)
+        handle = self._bind_and_schedule(
+            runtime, host, port, config, protocol, http2_config
+        )
         if not should_start:
             return handle
         primary_error: BaseException | None = None
@@ -447,6 +499,8 @@ class SmallServer:
         host: str,
         port: int,
         config: ServerConfig,
+        protocol: str,
+        http2_config: HTTP2Config | None,
     ) -> ServerHandle:
         """Shared validated bind-and-schedule core for ``serve`` and ``listen``."""
         from SmallPackage import SmallTask
@@ -455,6 +509,14 @@ class SmallServer:
             raise ValueError("host must be a non-empty string")
         if type(port) is not int or not 0 <= port <= 65535:
             raise ValueError("port must be an integer between 0 and 65535")
+        if protocol not in {"http1", "http2"}:
+            raise ValueError("protocol must be 'http1' or 'http2'")
+        if http2_config is not None and not isinstance(http2_config, HTTP2Config):
+            raise TypeError("http2_config must be an HTTP2Config or None")
+        if protocol == "http1" and http2_config is not None:
+            raise ValueError("http2_config requires protocol='http2'")
+        if protocol == "http2":
+            require_http2()
         marker = self._reserve_invocation()
 
         def release_marker() -> None:
@@ -522,6 +584,8 @@ class SmallServer:
                 wakeup,
                 config,
                 on_finalized=release,
+                protocol=protocol,
+                protocol_config=http2_config or HTTP2Config(),
                 route_observer_channel=observer_channel,
             )
         except BaseException as primary_error:
@@ -642,9 +706,14 @@ class SmallServer:
 
                 connection_task: Any = None
                 try:
+                    routine = (
+                        self._http2_connection_loop
+                        if handle._protocol == "http2"
+                        else self._connection_loop
+                    )
                     connection_task = SmallTask(
                         handle._config.connection_priority,
-                        self._connection_loop,
+                        routine,
                         args=(handle, client),
                         name="smallserver-connection",
                     )
@@ -743,10 +812,17 @@ class SmallServer:
             primary_error = exc
             raise
         finally:
-            observer_channel = handle._route_observer_channel
-            if route_error_event is not None and observer_channel is not None:
-                observer_channel.enqueue(route_error_event, task)
+            if route_error_event is not None:
+                self._enqueue_route_error(handle, route_error_event, task)
             handle._connection_finished(task, client, primary_error)
+
+    @staticmethod
+    def _enqueue_route_error(
+        handle: ServerHandle, event: RouteErrorEvent, task: Any
+    ) -> None:
+        observer_channel = handle._route_observer_channel
+        if observer_channel is not None:
+            observer_channel.enqueue(event, task)
 
     async def _dispatch_websocket(
         self,
@@ -793,3 +869,263 @@ class SmallServer:
         headers["Connection"] = "close"
         payload = Response(response.status, response.body, headers).to_http1()
         await handle._transport.send_all(task, client, payload)
+
+    async def _http2_connection_loop(
+        self, task: Any, handle: ServerHandle, client: TransportHandle
+    ) -> None:
+        from SmallPackage import SmallTask
+
+        protocol: H2Protocol | None = None
+        state: _H2ConnectionState | None = None
+        primary_error: BaseException | None = None
+        try:
+            protocol = H2Protocol(handle._protocol_config)
+            state = _H2ConnectionState(protocol)
+            await handle._transport.send_all(task, client, protocol.initiate())
+            writer = SmallTask(
+                handle._config.connection_priority,
+                self._http2_writer_loop,
+                args=(handle, client, state),
+                name="smallserver-http2-writer",
+            )
+            state.writer_task = writer
+            shutdown_task = SmallTask(
+                handle._config.connection_priority + 1,
+                self._http2_shutdown_enforcer,
+                args=(handle, client, state),
+                name="smallserver-http2-shutdown-enforcer",
+            )
+            state.shutdown_task = shutdown_task
+            watchdog = SmallTask(
+                handle._config.connection_priority + 1,
+                self._http2_watchdog,
+                args=(handle, client, state),
+                name="smallserver-http2-watchdog",
+            )
+            state.watchdog_task = watchdog
+            child_tasks = [writer, shutdown_task, watchdog]
+            handle._owned_tasks.extend(child_tasks)
+            handle._runtime.fork(child_tasks)
+            handle._graceful_connections.add(id(client))
+            handle._graceful_closers[id(client)] = state.request_shutdown
+            reader_batches = 0
+            while not handle.closed and not protocol.remote_closed:
+                chunk = await handle._transport.recv(
+                    task, client, handle._config.receive_chunk_bytes
+                )
+                if not chunk:
+                    break
+                state.mark_activity()
+                next_data = chunk
+                while True:
+                    try:
+                        ready = protocol.receive_data(next_data)
+                    except Exception as protocol_error:
+                        primary_error = protocol_error
+                        state.close_error_code = 1
+                        break
+                    for stream_id in protocol.take_cancelled_streams():
+                        handler = state.handlers.pop(stream_id, None)
+                        if handler is not None:
+                            handle._cancel_or_retain_task(handler)
+                    for item in ready:
+                        if not protocol.is_stream_active(item.stream_id):
+                            continue
+                        handler = SmallTask(
+                            handle._config.connection_priority,
+                            self._http2_handler,
+                            args=(handle, state, item.stream_id, item.request),
+                            name="smallserver-http2-stream-{}".format(item.stream_id),
+                        )
+                        state.handlers[item.stream_id] = handler
+                        handle._owned_tasks.append(handler)
+                        handle._runtime.fork(handler)
+                    state.wake_writer()
+                    reader_batches += 1
+                    if protocol.has_pending_input:
+                        await task.yield_now()
+                        reader_batches = 0
+                        next_data = b""
+                        continue
+                    if reader_batches >= protocol.config.reader_frame_batch_size:
+                        await task.yield_now()
+                        reader_batches = 0
+                    break
+                if primary_error is not None:
+                    break
+        except Exception as exc:
+            primary_error = exc
+        except BaseException as exc:
+            primary_error = exc
+            raise
+        finally:
+            if primary_error is None and state is not None:
+                primary_error = state.failure
+            if state is not None:
+                state.closing = True
+                for handler in tuple(state.handlers.values()):
+                    handle._cancel_or_retain_task(handler)
+                state.handlers.clear()
+                for child in (
+                    state.writer_task,
+                    state.shutdown_task,
+                    state.watchdog_task,
+                ):
+                    if child is not None and child is not task:
+                        handle._cancel_or_retain_task(child)
+                        if child in handle._owned_tasks:
+                            handle._owned_tasks.remove(child)
+            if protocol is not None and (
+                primary_error is None or isinstance(primary_error, Exception)
+            ):
+                try:
+                    goaway = protocol.close(
+                        state.close_error_code if state is not None else 1
+                    )
+                    if goaway and not client.closed:
+                        await handle._transport.send_all(task, client, goaway)
+                except BaseException:
+                    pass
+            handle._connection_finished(task, client, primary_error)
+
+    async def _http2_handler(
+        self,
+        task: Any,
+        handle: ServerHandle,
+        state: _H2ConnectionState,
+        stream_id: int,
+        request: Request,
+    ) -> None:
+        response_queued = False
+        try:
+            try:
+                response = await self.dispatch(request)
+            except RouteMatchTimeout as exc:
+                self._enqueue_route_error(
+                    handle,
+                    RouteErrorEvent(
+                        route_id=exc.route_id,
+                        category="route_match_timeout",
+                    ),
+                    task,
+                )
+                response = Response.text("internal server error", status=500)
+            except Exception:
+                response = Response.text("internal server error", status=500)
+            state.protocol.queue_response(stream_id, response)
+            response_queued = True
+            state.wake_writer()
+        finally:
+            if not response_queued:
+                state.protocol.drop_stream(stream_id)
+            state.handlers.pop(stream_id, None)
+            if task in handle._owned_tasks:
+                handle._owned_tasks.remove(task)
+
+    async def _http2_writer_loop(
+        self,
+        task: Any,
+        handle: ServerHandle,
+        client: TransportHandle,
+        state: _H2ConnectionState,
+    ) -> None:
+        try:
+            while not state.closing:
+                await task.wait_signal(_HTTP2_WRITER_SIGNAL)
+                if state.shutdown_requested:
+                    state.closing = True
+                    payload = state.protocol.close()
+                    if payload:
+                        await handle._transport.send_all(task, client, payload)
+                    handle._force_connection_close(client, task)
+                    return
+                while not state.closing:
+                    payload = state.protocol.flush()
+                    if not payload:
+                        break
+                    await handle._transport.send_all(task, client, payload)
+        except Exception as error:
+            state.failure = error
+            state.closing = True
+            handle._force_connection_close(client, task, error)
+            raise
+        finally:
+            if task in handle._owned_tasks:
+                handle._owned_tasks.remove(task)
+
+    async def _http2_shutdown_enforcer(
+        self,
+        task: Any,
+        handle: ServerHandle,
+        client: TransportHandle,
+        state: _H2ConnectionState,
+    ) -> None:
+        try:
+            await task.wait_signal(_HTTP2_SHUTDOWN_SIGNAL)
+            await task.yield_now()
+            if client.closed:
+                return
+            state.closing = True
+            handle._force_connection_close(client, task, state.failure)
+        finally:
+            if task in handle._owned_tasks:
+                handle._owned_tasks.remove(task)
+
+    async def _http2_watchdog(
+        self,
+        task: Any,
+        handle: ServerHandle,
+        client: TransportHandle,
+        state: _H2ConnectionState,
+    ) -> None:
+        config = state.protocol.config
+        try:
+            handshake_elapsed = 0.0
+            while not state.protocol.preface_received and not state.closing:
+                interval = min(1.0, config.handshake_timeout - handshake_elapsed)
+                await task.sleep(interval)
+                handshake_elapsed += interval
+                if handshake_elapsed >= config.handshake_timeout:
+                    self._http2_force_close(
+                        task,
+                        handle,
+                        client,
+                        state,
+                        TimeoutError("HTTP/2 client preface timed out"),
+                    )
+                    return
+
+            observed_epoch = state.activity_epoch
+            idle_elapsed = 0.0
+            while not state.closing:
+                interval = min(1.0, config.idle_timeout - idle_elapsed)
+                await task.sleep(interval)
+                if observed_epoch != state.activity_epoch:
+                    observed_epoch = state.activity_epoch
+                    idle_elapsed = 0.0
+                    continue
+                idle_elapsed += interval
+                if idle_elapsed >= config.idle_timeout:
+                    self._http2_force_close(
+                        task,
+                        handle,
+                        client,
+                        state,
+                        TimeoutError("HTTP/2 connection was idle too long"),
+                    )
+                    return
+        finally:
+            if task in handle._owned_tasks:
+                handle._owned_tasks.remove(task)
+
+    @staticmethod
+    def _http2_force_close(
+        task: Any,
+        handle: ServerHandle,
+        client: TransportHandle,
+        state: _H2ConnectionState,
+        error: BaseException,
+    ) -> None:
+        state.failure = error
+        state.closing = True
+        handle._force_connection_close(client, task, error)
