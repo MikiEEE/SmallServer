@@ -2,17 +2,18 @@
 
 ## Requirements
 
-SmallServer requires Python 3.10 or newer. During development,
-`requirements.txt` installs SmallOS from the canonical GitHub `master` branch;
-SmallServer itself declares no package-index runtime dependency yet.
+SmallServer requires Python 3.10 or newer. `requirements.txt` installs the
+canonical SmallOS GitHub release tagged `v1.2.0`; SmallServer itself declares
+no package-index runtime dependency yet.
 
 ```console
 python3 -m pip install -r requirements.txt
 python3 -m pip install -e .
 ```
 
-The first command needs Git and network access. Pin the SmallOS revision in
-your own deployment lock or build process if reproducibility matters.
+The first command needs Git and network access. The release tag makes the
+SmallOS source revision reproducible; deployments should still lock all of
+their transitive build dependencies.
 
 ## Create an application
 
