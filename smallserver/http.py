@@ -118,7 +118,7 @@ class Response:
 
     status: int = 200
     body: bytes = b""
-    headers: Headers = Headers()
+    headers: Headers = field(default_factory=Headers)
 
     def __post_init__(self) -> None:
         if not isinstance(self.status, int) or not 100 <= self.status <= 599:

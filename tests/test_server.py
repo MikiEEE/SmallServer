@@ -1,8 +1,24 @@
+import gc
+import threading
 import unittest
+import warnings
 from unittest.mock import patch
 
-from smallserver import RouteErrorEvent, SmallServer
-from smallserver.server import HTTPParseError, HTTPRequestParser, RouteObserverChannel, ServerConfig
+from smallserver import (
+    ManagedRuntimeConfig,
+    RouteErrorEvent,
+    ServerStartupError,
+    SmallServer,
+)
+from smallserver.errors import _CleanupTransaction
+from smallserver.server import (
+    HTTPParseError,
+    HTTPRequestParser,
+    RouteObserverChannel,
+    ServerConfig,
+)
+
+from tests.kernel_fakes import FakeKernel
 
 
 class HTTPRequestParserTests(unittest.TestCase):
@@ -111,65 +127,73 @@ class HTTPRequestParserTests(unittest.TestCase):
         self.assertFalse(failing_channel.enqueue(first, FailingSourceTask()))
         self.assertEqual(list(failing_channel.events), [])
         self.assertEqual(failing_channel.dropped, 1)
+        with self.assertRaisesRegex(TypeError, "managed_runtime"):
+            ServerConfig(managed_runtime={})  # type: ignore[arg-type]
 
-    def test_serve_closes_bound_socket_when_runtime_fork_fails(self) -> None:
-        class Listener:
-            closed = False
+    def test_managed_runtime_config_is_validated_and_defensively_copied(self) -> None:
+        source = {"http": {"max_response_size": 4096}}
+        config = ManagedRuntimeConfig(
+            task_capacity=128,
+            priority_levels=4,
+            io_buffer_length=0,
+            eternal_watchers=True,
+            client_defaults=source,
+        )
+        source["http"]["max_response_size"] = 1
 
-            def setsockopt(self, *args) -> None:
-                pass
+        self.assertEqual(
+            config.to_smallos_config(),
+            {
+                "task_capacity": 128,
+                "priority_levels": 4,
+                "io_buffer_length": 0,
+                "eternal_watchers": True,
+                "client_defaults": {"http": {"max_response_size": 4096}},
+            },
+        )
+        with self.assertRaises(TypeError):
+            config.client_defaults["http"]["max_response_size"] = 1  # type: ignore[index]
 
-            def bind(self, address) -> None:
-                pass
+        invalid_values = (
+            {"task_capacity": True},
+            {"priority_levels": 1},
+            {"io_buffer_length": -1},
+            {"eternal_watchers": 1},
+            {"client_defaults": {"http": {"max_response_size": -1}}},
+        )
+        for values in invalid_values:
+            with self.subTest(values=values), self.assertRaises((TypeError, ValueError)):
+                ManagedRuntimeConfig(**values)  # type: ignore[arg-type]
 
-            def listen(self, backlog) -> None:
-                pass
-
-            def setblocking(self, blocking) -> None:
-                pass
-
-            def close(self) -> None:
-                self.closed = True
-
+    def test_serve_closes_kernel_resources_when_runtime_fork_fails(self) -> None:
         class Runtime:
-            cancelled = 0
+            def __init__(self) -> None:
+                self.kernel = FakeKernel()
+                self.cancelled = 0
 
             def fork(self, tasks) -> None:
                 raise RuntimeError("no task capacity")
 
             def cancel_task(self, task) -> None:
                 self.cancelled += 1
+                task.cancel()
 
-        listener = Listener()
+            def resume_task(self, task) -> None:
+                pass
+
         runtime = Runtime()
-        with patch("smallserver.app.socket.socket", return_value=listener):
-            with self.assertRaisesRegex(RuntimeError, "capacity"):
-                SmallServer().serve(runtime)
-        self.assertTrue(listener.closed)
+        with self.assertRaisesRegex(RuntimeError, "capacity"):
+            SmallServer().serve(runtime)
         self.assertEqual(runtime.cancelled, 2)
+        self.assertEqual([handle.name for handle in runtime.kernel.closed], ["listener"])
+        self.assertEqual(runtime.kernel.wakeup.close_calls, 1)
 
-    def test_observer_task_is_included_in_startup_rollback(self) -> None:
-        class Listener:
-            closed = False
-
-            def setsockopt(self, *args) -> None:
-                pass
-
-            def bind(self, address) -> None:
-                pass
-
-            def listen(self, backlog) -> None:
-                pass
-
-            def setblocking(self, blocking) -> None:
-                pass
-
-            def close(self) -> None:
-                self.closed = True
-
+    def test_observer_task_is_owned_by_startup_rollback(self) -> None:
         class Runtime:
-            tasks = []
-            cancelled = []
+            def __init__(self) -> None:
+                self.kernel = FakeKernel()
+                self.tasks = []
+                self.cancelled = []
 
             def fork(self, tasks) -> None:
                 self.tasks = list(tasks)
@@ -177,15 +201,16 @@ class HTTPRequestParserTests(unittest.TestCase):
 
             def cancel_task(self, task) -> None:
                 self.cancelled.append(task)
+                task.cancel()
 
-        listener = Listener()
+            def resume_task(self, task) -> None:
+                pass
+
         runtime = Runtime()
         app = SmallServer(route_error_observer=lambda event: None)
-        with patch("smallserver.app.socket.socket", return_value=listener):
-            with self.assertRaisesRegex(RuntimeError, "capacity"):
-                app.serve(runtime)
-        self.assertTrue(listener.closed)
-        self.assertEqual(len(runtime.tasks), 3)
+        with self.assertRaisesRegex(RuntimeError, "capacity"):
+            app.serve(runtime)
+
         self.assertEqual(runtime.cancelled, runtime.tasks)
         self.assertEqual(
             [task.name for task in runtime.tasks],
@@ -195,3 +220,265 @@ class HTTPRequestParserTests(unittest.TestCase):
                 "smallserver-route-observer",
             ],
         )
+        self.assertEqual([handle.name for handle in runtime.kernel.closed], ["listener"])
+        self.assertEqual(runtime.kernel.wakeup.close_calls, 1)
+
+    def test_serve_closes_kernel_resources_when_task_construction_fails(self) -> None:
+        from SmallPackage import SmallTask as RealSmallTask
+
+        class Runtime:
+            def __init__(self) -> None:
+                self.kernel = FakeKernel()
+                self.cancelled = []
+
+            def fork(self, tasks) -> None:
+                pass
+
+            def resume_task(self, task) -> None:
+                pass
+
+            def cancel_task(self, task) -> None:
+                self.cancelled.append(task)
+                task.cancel()
+
+        calls = 0
+
+        def construct_task(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("task failed")
+            return RealSmallTask(*args, **kwargs)
+
+        runtime = Runtime()
+        with patch("SmallPackage.SmallTask", side_effect=construct_task):
+            with self.assertRaisesRegex(RuntimeError, "task failed"):
+                SmallServer().serve(runtime)
+        self.assertEqual(len(runtime.cancelled), 1)
+        self.assertEqual([handle.name for handle in runtime.kernel.closed], ["listener"])
+        self.assertEqual(runtime.kernel.wakeup.close_calls, 1)
+
+    def test_listener_setup_failure_retains_owner_until_retry_succeeds(self) -> None:
+        class Runtime:
+            def __init__(self) -> None:
+                self.kernel = FakeKernel()
+
+            def fork(self, tasks) -> None:
+                pass
+
+            def resume_task(self, task) -> None:
+                pass
+
+            def cancel_task(self, task) -> None:
+                pass
+
+        runtime = Runtime()
+        primary = RuntimeError("listen setup failed")
+        runtime.kernel.operation_errors["listen"] = primary
+        runtime.kernel.close_failures[id(runtime.kernel.listener)] = 2
+
+        with self.assertRaises(ServerStartupError) as raised:
+            SmallServer().serve(runtime)
+
+        error = raised.exception
+        self.assertIs(error.primary_error, primary)
+        self.assertEqual(len(error.cleanup_errors), 1)
+        self.assertFalse(error.retry_cleanup())
+        self.assertTrue(error.retry_cleanup())
+        self.assertTrue(error.retry_cleanup())
+        self.assertTrue(error.cleanup_complete)
+        self.assertEqual(runtime.kernel.closed, [runtime.kernel.listener])
+
+    def test_wakeup_failure_retains_owner_until_retry_succeeds(self) -> None:
+        class Runtime:
+            def __init__(self) -> None:
+                self.kernel = FakeKernel()
+
+            def fork(self, tasks) -> None:
+                pass
+
+            def resume_task(self, task) -> None:
+                pass
+
+            def cancel_task(self, task) -> None:
+                pass
+
+        runtime = Runtime()
+        runtime.kernel.invalid_wait_objects.add(id(runtime.kernel.wakeup.wait_object))
+        runtime.kernel.wakeup.close_failures = 2
+
+        with self.assertRaises(ServerStartupError) as raised:
+            SmallServer().serve(runtime)
+
+        error = raised.exception
+        self.assertIsInstance(error.primary_error, ValueError)
+        self.assertEqual(runtime.kernel.closed, [runtime.kernel.listener])
+        self.assertFalse(error.finalize())
+        self.assertTrue(error.finalize())
+        self.assertEqual(runtime.kernel.wakeup.close_calls, 3)
+
+    def test_task_registration_failure_retains_all_server_resources(self) -> None:
+        class Runtime:
+            def __init__(self) -> None:
+                self.kernel = FakeKernel()
+                self.cancelled = []
+
+            def fork(self, tasks) -> None:
+                raise RuntimeError("no task capacity")
+
+            def cancel_task(self, task) -> None:
+                self.cancelled.append(task)
+                task.cancel()
+
+            def resume_task(self, task) -> None:
+                pass
+
+        runtime = Runtime()
+        runtime.kernel.close_failures[id(runtime.kernel.listener)] = 2
+        runtime.kernel.wakeup.close_failures = 2
+
+        with self.assertRaises(ServerStartupError) as raised:
+            SmallServer().serve(runtime)
+
+        error = raised.exception
+        self.assertEqual(str(error.primary_error), "no task capacity")
+        self.assertEqual(len(error.cleanup_errors), 2)
+        self.assertFalse(error.retry_cleanup())
+        self.assertTrue(error.retry_cleanup())
+        self.assertEqual(runtime.kernel.closed, [runtime.kernel.listener])
+        self.assertEqual(runtime.kernel.wakeup.close_calls, 3)
+
+    def test_task_cancellation_failure_is_owned_until_retry(self) -> None:
+        class Runtime:
+            def __init__(self) -> None:
+                self.kernel = FakeKernel()
+                self.cancel_attempts: dict[int, int] = {}
+
+            def fork(self, tasks) -> None:
+                raise RuntimeError("registration failed")
+
+            def cancel_task(self, task) -> None:
+                attempts = self.cancel_attempts.get(id(task), 0) + 1
+                self.cancel_attempts[id(task)] = attempts
+                if attempts <= 2:
+                    raise RuntimeError("cancel failed")
+                task.cancel()
+
+            def resume_task(self, task) -> None:
+                pass
+
+        runtime = Runtime()
+        with self.assertRaises(ServerStartupError) as raised:
+            SmallServer().serve(runtime)
+
+        error = raised.exception
+        self.assertEqual(str(error.primary_error), "registration failed")
+        self.assertEqual(len(error.cleanup_errors), 2)
+        self.assertFalse(error.retry_cleanup())
+        self.assertTrue(error.retry_cleanup())
+        self.assertTrue(error.cleanup_complete)
+        self.assertEqual(runtime.kernel.closed, [runtime.kernel.listener])
+        self.assertEqual(runtime.kernel.wakeup.close_calls, 1)
+
+    def test_interrupt_identity_survives_successful_and_failed_rollback(self) -> None:
+        class Runtime:
+            def __init__(self) -> None:
+                self.kernel = FakeKernel()
+
+            def fork(self, tasks) -> None:
+                pass
+
+            def resume_task(self, task) -> None:
+                pass
+
+            def cancel_task(self, task) -> None:
+                pass
+
+        for interrupt in (KeyboardInterrupt("stop"), SystemExit(7)):
+            for close_failures in (0, 1):
+                with self.subTest(
+                    interrupt=type(interrupt).__name__,
+                    close_failures=close_failures,
+                ):
+                    runtime = Runtime()
+                    runtime.kernel.operation_errors["listen"] = interrupt
+                    runtime.kernel.close_failures[id(runtime.kernel.listener)] = (
+                        close_failures
+                    )
+                    with self.assertRaises(type(interrupt)) as raised:
+                        SmallServer().serve(runtime)
+                    self.assertIs(raised.exception, interrupt)
+                    if close_failures:
+                        cleanup = raised.exception.__cause__
+                        self.assertIsInstance(cleanup, ServerStartupError)
+                        assert isinstance(cleanup, ServerStartupError)
+                        self.assertIs(cleanup.primary_error, interrupt)
+                        self.assertTrue(cleanup.retry_cleanup())
+                    else:
+                        self.assertNotIsInstance(
+                            raised.exception.__cause__, ServerStartupError
+                        )
+
+    def test_abandoned_startup_error_retries_and_warns_if_incomplete(self) -> None:
+        transaction = _CleanupTransaction()
+        attempts = []
+
+        def fail_cleanup() -> None:
+            attempts.append(1)
+            raise RuntimeError("still owned")
+
+        transaction.add("listener", fail_cleanup, RuntimeError("first failure"))
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", ResourceWarning)
+            error = ServerStartupError(RuntimeError("startup"), transaction)
+            del error
+            gc.collect()
+
+        self.assertEqual(attempts, [1])
+        self.assertEqual(len(caught), 1)
+        self.assertIs(caught[0].category, ResourceWarning)
+        self.assertNotIn("listener", str(caught[0].message))
+
+    def test_startup_cleanup_retry_is_concurrently_idempotent(self) -> None:
+        transaction = _CleanupTransaction()
+        entered = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        def cleanup() -> None:
+            calls.append(1)
+            entered.set()
+            if not release.wait(2):
+                raise TimeoutError("cleanup test stalled")
+
+        transaction.add("listener", cleanup, RuntimeError("initial failure"))
+        error = ServerStartupError(RuntimeError("startup"), transaction)
+        results = []
+        workers = [
+            threading.Thread(target=lambda: results.append(error.retry_cleanup()))
+            for _ in range(2)
+        ]
+        workers[0].start()
+        self.assertTrue(entered.wait(1))
+        workers[1].start()
+        release.set()
+        for worker in workers:
+            worker.join(2)
+
+        self.assertEqual(calls, [1])
+        self.assertEqual(results, [True, True])
+        self.assertTrue(error.cleanup_complete)
+
+    def test_server_startup_error_public_typing_fixture_compiles(self) -> None:
+        fixture = """
+from smallserver import ServerStartupError
+
+def finish_startup_cleanup(error: ServerStartupError) -> bool:
+    primary: BaseException = error.primary_error
+    pending: tuple[BaseException, ...] = error.cleanup_errors
+    return error.cleanup_complete or error.finalize()
+"""
+        code = compile(fixture, "server_startup_error_typing.py", "exec")
+        namespace = {}
+        exec(code, namespace)
+        self.assertTrue(callable(namespace["finish_startup_cleanup"]))

@@ -5,6 +5,13 @@ from smallserver import Headers, Request, Response
 
 
 class HTTPValueTests(unittest.TestCase):
+    def test_response_default_headers_use_a_factory(self) -> None:
+        first = Response()
+        second = Response()
+
+        self.assertIsNot(first.headers, second.headers)
+        self.assertEqual(dict(first.headers.items()), {})
+
     def test_headers_are_case_insensitive_and_immutable(self) -> None:
         headers = Headers({"Content-Type": "text/plain"})
         self.assertEqual(headers["content-type"], "text/plain")
