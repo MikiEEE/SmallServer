@@ -91,6 +91,8 @@ configure it directly with `SmallOS(config=...)`; SmallServer rejects
 `task_capacity` must reserve at least `max_connections + 2` task slots for the
 listener and shutdown-control tasks, and both server task priorities must be
 below `priority_levels`.
+Configuring a regex route-error observer adds one dedicated SmallOS task, so
+that mode requires at least `max_connections + 3` slots.
 
 Managed `listen()` blocks and catches Ctrl-C after closing its listener, wakeup
 channel, connections, and server tasks. It returns the closed `ServerHandle`,
