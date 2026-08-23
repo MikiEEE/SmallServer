@@ -12,9 +12,10 @@ that runtime, and starts it. If the dependency or Unix kernel is unavailable,
 it raises `ServerConfigurationError` and asks the caller to provide a suitable
 runtime.
 
-The canonical SmallOS dependency is installed from GitHub `master` by
-`requirements.txt`. Python package metadata intentionally has no runtime
-dependency until SmallOS has an unambiguous published distribution contract.
+The canonical SmallOS dependency is installed from the GitHub `v1.2.0` release
+tag by `requirements.txt`. Python package metadata intentionally has no runtime
+dependency until SmallOS has an unambiguous package-index distribution
+contract.
 
 ## Custom and constrained kernels
 
