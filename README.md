@@ -20,7 +20,7 @@ if __name__ == "__main__":
     app.listen(host="127.0.0.1", port=8000)
 ```
 
-Install the canonical SmallOS master dependency, the package, and test tools:
+Install the pinned SmallOS v1.2.0 release, the package, and test tools:
 
 ```console
 python3 -m pip install -r requirements.txt

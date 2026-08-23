@@ -2,7 +2,7 @@
 
 ## Set up
 
-Use Python 3.10 or newer and install the canonical SmallOS master checkout plus
+Use Python 3.10 or newer and install the pinned SmallOS v1.2.0 release plus
 SmallServer in editable mode:
 
 ```console
