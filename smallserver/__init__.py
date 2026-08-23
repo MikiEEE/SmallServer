@@ -31,12 +31,41 @@ from .websocket import (
 )
 
 if TYPE_CHECKING:
-    from .adapters import AdapterRegistry, AdapterShutdownError, http_error_from_adapter
+    from .adapters import (
+        AdapterCancelledError,
+        AdapterCapacityError,
+        AdapterClosedError,
+        AdapterError,
+        AdapterExecutionError,
+        AdapterProtocolError,
+        AdapterRegistry,
+        AdapterShutdownError,
+        AdapterUnavailableError,
+        AsyncioAdapter,
+        ThreadAdapter,
+        http_error_from_adapter,
+    )
+
+
+_ADAPTER_EXPORTS = {
+    "AdapterCancelledError",
+    "AdapterCapacityError",
+    "AdapterClosedError",
+    "AdapterError",
+    "AdapterExecutionError",
+    "AdapterProtocolError",
+    "AdapterRegistry",
+    "AdapterShutdownError",
+    "AdapterUnavailableError",
+    "AsyncioAdapter",
+    "ThreadAdapter",
+    "http_error_from_adapter",
+}
 
 
 def __getattr__(name: str) -> Any:
     """Load optional SmallOS adapter integration only when it is requested."""
-    if name in {"AdapterRegistry", "AdapterShutdownError", "http_error_from_adapter"}:
+    if name in _ADAPTER_EXPORTS:
         from . import adapters
 
         value = getattr(adapters, name)
@@ -45,8 +74,16 @@ def __getattr__(name: str) -> Any:
     raise AttributeError("module {!r} has no attribute {!r}".format(__name__, name))
 
 __all__ = [
+    "AdapterCancelledError",
+    "AdapterCapacityError",
+    "AdapterClosedError",
+    "AdapterError",
+    "AdapterExecutionError",
+    "AdapterProtocolError",
     "AdapterRegistry",
     "AdapterShutdownError",
+    "AdapterUnavailableError",
+    "AsyncioAdapter",
     "Headers",
     "HTTPError",
     "HTTP2Config",
@@ -64,6 +101,7 @@ __all__ = [
     "ServerHandle",
     "ServerStartupError",
     "SmallServer",
+    "ThreadAdapter",
     "WebSocket",
     "WebSocketCapacityError",
     "WebSocketConfig",
