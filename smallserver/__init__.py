@@ -10,6 +10,13 @@ from .errors import (
     ServerStartupError,
 )
 from .http import Headers, Request, Response
+from .routing import (
+    RegexRouteConfig,
+    RegexRoutesUnavailable,
+    RouteErrorEvent,
+    RouteMatchTimeout,
+    RoutePathTooLarge,
+)
 from .runtime import ManagedRuntimeConfig
 from .server import ServerConfig, ServerHandle
 
@@ -32,9 +39,14 @@ __all__ = [
     "AdapterShutdownError",
     "Headers",
     "HTTPError",
+    "RegexRouteConfig",
+    "RegexRoutesUnavailable",
     "ManagedRuntimeConfig",
     "Request",
     "Response",
+    "RouteErrorEvent",
+    "RouteMatchTimeout",
+    "RoutePathTooLarge",
     "ServerConfig",
     "ServerConfigurationError",
     "ServerFinalizationError",

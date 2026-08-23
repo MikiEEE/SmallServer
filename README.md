@@ -1,14 +1,17 @@
 # SmallServer
 
 SmallServer is a SmallOS-native web framework in early development. It provides
-a bounded HTTP/1.1 server, static async routing for GET, POST, PUT, PATCH, and
-DELETE, and explicit escape hatches for blocking and asyncio-native libraries.
+a bounded HTTP/1.1 server and async routing for GET, POST, PUT, PATCH, and
+DELETE. Static routes are built in, timeout-bounded regular-expression routes
+are available through an optional dependency, and explicit escape hatches
+support blocking and asyncio-native libraries.
 
 ## Current scope
 
 The current package provides an HTTP/1.1 baseline over a SmallOS runtime. It can:
 
-- register static async routes for GET, POST, PUT, PATCH, and DELETE;
+- register static or optional regular-expression async routes for GET, POST,
+  PUT, PATCH, and DELETE;
 - dispatch an already-created `Request` to a handler;
 - return deterministic `Response` values, including HTTP/1.1 bytes;
 - return 404 for an unknown path and 405 with `Allow` for a known path using
@@ -18,7 +21,8 @@ The current package provides an HTTP/1.1 baseline over a SmallOS runtime. It can
 - parse one `Content-Length` HTTP/1.1 request per connection and close after
   its response.
 
-Keep-alive/pipelining, TLS, path parameters, and HTTP/2 are not implemented yet.
+Keep-alive/pipelining, TLS, automatic path templates, and HTTP/2 are not
+implemented yet.
 
 ## Install for development
 
@@ -27,6 +31,14 @@ python3 -m pip install -r requirements.txt
 python3 -m pip install -e .
 python3 -m unittest discover -s tests -v
 ```
+
+Install the optional matching engine when an application uses raw regex routes:
+
+```bash
+python3 -m pip install -e '.[regex-routes]'
+```
+
+Static routing neither imports nor requires that dependency.
 
 SmallOS is installed from the canonical `master` branch in `requirements.txt`.
 It owns scheduling, socket readiness, and foreign execution adapters.
@@ -95,6 +107,8 @@ configure it directly with `SmallOS(config=...)`; SmallServer rejects
 `task_capacity` must reserve at least `max_connections + 2` task slots for the
 listener and shutdown-control tasks, and both server task priorities must be
 below `priority_levels`.
+Configuring a regex route-error observer adds one dedicated SmallOS task, so
+that mode requires at least `max_connections + 3` slots.
 
 Managed `listen()` blocks and catches Ctrl-C after closing its listener, wakeup
 channel, connections, and server tasks. It returns the closed `ServerHandle`,
@@ -221,8 +235,78 @@ async def delete_widgets(request: Request) -> Response:
     return Response(status=204)
 ```
 
-Route paths are static in this release. Path parameters and richer lifecycle
-hooks are deferred; the current `ServerHandle` provides explicit shutdown.
+Static route lookup is dictionary-based and always takes precedence over a
+regex route for the same method and path. Richer lifecycle hooks are deferred;
+the current `ServerHandle` provides explicit shutdown.
+
+## Define regular-expression routes
+
+Regex routes use full-path matching and run in registration order after static
+lookup. Only named captures become immutable `request.path_params`; an optional
+group that did not participate is omitted.
+
+```python
+@app.get_regex(r"/users/(?P<user_id>[0-9]+)")
+async def get_user(request: Request) -> Response:
+    return Response.json({"user_id": request.path_params["user_id"]})
+
+@app.route_regex(
+    r"/articles/(?P<slug>[a-z0-9]+(?:-[a-z0-9]+)*)",
+    methods=("GET", "PATCH"),
+)
+async def article(request: Request) -> Response:
+    return Response.json({"slug": request.path_params["slug"]})
+```
+
+Patterns must begin with a literal `/` and do not need `^` or `$`. SmallServer
+wraps the complete expression in a slash guard, so every top-level alternative
+is constrained to an origin-form path. They are trusted application
+configuration, but paths are hostile input: SmallServer
+bounds pattern length, route count, named captures, path bytes, each match, and
+the total matching time. Prefer unambiguous repetition and narrow character
+classes even with these deadlines. A timeout raises `RouteMatchTimeout` with an
+opaque route ID and becomes a sanitized 500 response on the network path.
+
+Applications can observe that failure without receiving the hostile target:
+
+```python
+from smallserver import RouteErrorEvent
+
+def observe_route_error(event: RouteErrorEvent) -> None:
+    logger.error("route matching failed: %s (%s)", event.route_id, event.category)
+
+app = SmallServer(route_error_observer=observe_route_error)
+```
+
+The observer receives a fresh, immutable, traceback-free event containing only
+an opaque route ID and category. A bounded scheduler-local queue delivers it on
+one dedicated SmallOS task, separate from the request task. The synchronous
+observer must return quickly and must not block; blocking and async observers
+remain an execution-adapter follow-up. Failures are isolated from responses
+and counted by `server.route_observer_failures`. Capacity drops are counted by
+`server.dropped_route_error_events`; tune the positive queue bound with
+`ServerConfig(max_route_error_events=...)`. A path above the configured
+regex-routing byte limit returns 414 before matching begins.
+
+Requests retain the exact ASCII origin-form target in `request.raw_target`.
+Routing uses `request.path`, which excludes the query string;
+`request.query_string` contains the raw text after `?`. Neither paths nor named
+captures are percent-decoded, so `/files/a%2Fb` remains distinct from
+`/files/a/b`. `request.route_pattern` identifies a selected regex pattern;
+static dispatch passes the original request through without adding route
+context.
+
+Run `python benchmarks/route_benchmark.py` for a same-process comparison of
+the pre-router dictionary dispatch model and current router dispatch. Its JSON
+also records configured versus observed hostile-pattern timeout when the extra
+is installed; rates are machine-specific and should be compared on the same
+host.
+Use `python benchmarks/route_benchmark.py --release` to enforce the documented
+static-dispatch floor of 80% of the legacy model across repeated rounds.
+
+Release validation can run `python tests/installed_regex_smoke.py` from an
+environment where the built `smallserver[regex-routes]` wheel is installed.
+The project requires Python 3.10 or newer.
 
 ## Dispatch a request
 
