@@ -1,68 +1,64 @@
 # SmallServer
 
-SmallServer is a SmallOS-native web framework in early development. It provides
-a bounded HTTP/1.1 server, static async routing for GET, POST, PUT, PATCH, and
-DELETE, and explicit escape hatches for blocking and asyncio-native libraries.
-
-## Current scope
-
-The current package provides an HTTP/1.1 baseline over a SmallOS runtime. It can:
-
-- register static async routes for GET, POST, PUT, PATCH, and DELETE;
-- dispatch an already-created `Request` to a handler;
-- return deterministic `Response` values, including HTTP/1.1 bytes;
-- return 404 for an unknown path and 405 with `Allow` for a known path using
-  the wrong method.
-- bind a non-blocking TCP listener, accept bounded concurrent connections, and
-  wait for read/write readiness through SmallOS;
-- parse one `Content-Length` HTTP/1.1 request per connection and close after
-  its response.
-
-Keep-alive/pipelining, TLS, path parameters, and HTTP/2 are not implemented yet.
-
-## Install for development
-
-```bash
-python3 -m pip install -r requirements.txt
-python3 -m pip install -e .
-python3 -m unittest discover -s tests -v
-```
-
-SmallOS is installed from the canonical `master` branch in `requirements.txt`.
-It owns scheduling, socket readiness, and foreign execution adapters.
-
-## Run the demo
-
-The included demo starts a task API at `http://127.0.0.1:8000`. Common
-application code does not need to import or configure SmallOS.
-
-```bash
-python3 -m pip install -r requirements.txt
-python3 demo.py
-```
-
-Leave the process running and exercise GET, POST, PUT, PATCH, and DELETE from a
-browser or HTTP client. Press Ctrl-C for deterministic cleanup without a
-traceback. The static `/tasks` path is intentional: path parameters arrive
-with a later milestone.
-
-## Bind a server
-
-Create the application and call blocking `listen()`. It lazily creates a
-SmallOS runtime with the Unix kernel, while SmallOS remains the scheduler and
-owner of socket readiness. `port=0` asks the operating system for an available
-port, which is useful in tests and local tooling.
+SmallServer is a SmallOS-native web framework for Python 3.10+. It serves
+bounded HTTP/1.1 requests, exact and timeout-bounded regex routes, optional
+RFC 6455 WebSockets, explicit runtime lifecycle control, and third-party
+execution adapters.
 
 ```python
 from smallserver import Response, SmallServer
 
 app = SmallServer()
 
+
 @app.get("/health")
 async def health(request):
     return Response.json({"status": "ok"})
 
-app.listen(host="127.0.0.1", port=8000)
+
+if __name__ == "__main__":
+    app.listen(host="127.0.0.1", port=8000)
+```
+
+Install the canonical SmallOS master dependency and this package, then run the
+demo:
+
+```console
+python3 -m pip install -r requirements.txt
+python3 -m pip install -e .
+python3 demo.py
+```
+
+Application code can use blocking `app.listen()` without importing SmallOS.
+Advanced applications can supply their own runtime, schedule without starting
+it, and own adapters for blocking or asyncio-native libraries.
+
+## Optional features
+
+Static routing and HTTP-only imports need neither optional protocol package.
+Install only the feature an application serves:
+
+```console
+python3 -m pip install -e '.[regex-routes]'
+python3 -m pip install -e '.[websocket]'
+```
+
+Regex routes use bounded full-path matching after exact static lookup.
+WebSocket routes use a separate static route table, so an ordinary `GET` and a
+WebSocket Upgrade may coexist at one path.
+
+```python
+from smallserver import WebSocket
+
+
+@app.websocket("/echo", origins={"https://app.example.com"})
+async def echo(socket: WebSocket) -> None:
+    await socket.accept()
+    async for message in socket:
+        if message.is_text:
+            await socket.send_text(message.text)
+        else:
+            await socket.send_bytes(message.bytes)
 ```
 
 ### Configure the managed SmallOS runtime
@@ -95,6 +91,8 @@ configure it directly with `SmallOS(config=...)`; SmallServer rejects
 `task_capacity` must reserve at least `max_connections + 2` task slots for the
 listener and shutdown-control tasks, and both server task priorities must be
 below `priority_levels`.
+Configuring a regex route-error observer adds one dedicated SmallOS task, so
+that mode requires at least `max_connections + 3` slots.
 
 Managed `listen()` blocks and catches Ctrl-C after closing its listener, wakeup
 channel, connections, and server tasks. It returns the closed `ServerHandle`,
@@ -102,18 +100,28 @@ whose cached `address` and `port` remain available for diagnostics. Each
 current connection accepts one request and sends a `Connection: close`
 response.
 
-If the runtime exits normally but cleanup is incomplete, `listen()` raises
-`ServerFinalizationError`; retain it and call `retry_cleanup()` until it
-succeeds. If runtime startup raises while cleanup is incomplete, ordinary
-failures are wrapped by `ServerStartupError`; `KeyboardInterrupt` and
-`SystemExit` keep their identity and expose that cleanup owner as `__cause__`.
-Until cleanup succeeds, the application rejects another listener invocation.
+## Documentation
 
-## Advanced runtime control
+- [Guide index](guide/index.md)
+- [Getting started](guide/getting-started.md)
+- [Routing](guide/routing.md)
+- [WebSockets](guide/websockets.md)
+- [Requests and responses](guide/requests-and-responses.md)
+- [Runtime and lifecycle](guide/runtime-lifecycle.md)
+- [Configuration](guide/configuration.md)
+- [Third-party adapters](guide/adapters.md)
+- [Errors and observability](guide/errors-observability.md)
+- [Platforms and kernels](guide/platforms-kernels.md)
+- [API reference](guide/api-reference.md)
+- [Protocol roadmap](guide/protocol-roadmap.md)
+- [Development](guide/development.md)
 
-Supply a configured runtime when the application needs to coordinate other
-SmallOS tasks. A supplied runtime is never reconfigured or destroyed, and
-`start=False` schedules the server without starting it:
+See [`demo.py`](demo.py) for all five HTTP methods and a WebSocket route,
+[`examples/websocket_echo.py`](examples/websocket_echo.py) for a bounded echo
+server, [`examples/manual_runtime.py`](examples/manual_runtime.py) for
+caller-owned SmallOS startup, and
+[`examples/adapters_demo.py`](examples/adapters_demo.py) for blocking and
+asyncio escape hatches.
 
 ```python
 from SmallPackage import SmallOS, Unix
