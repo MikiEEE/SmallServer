@@ -1,9 +1,17 @@
 import unittest
+from types import MappingProxyType
 
 from smallserver import Headers, Request, Response
 
 
 class HTTPValueTests(unittest.TestCase):
+    def test_response_default_headers_use_a_factory(self) -> None:
+        first = Response()
+        second = Response()
+
+        self.assertIsNot(first.headers, second.headers)
+        self.assertEqual(dict(first.headers.items()), {})
+
     def test_headers_are_case_insensitive_and_immutable(self) -> None:
         headers = Headers({"Content-Type": "text/plain"})
         self.assertEqual(headers["content-type"], "text/plain")
@@ -31,3 +39,28 @@ class HTTPValueTests(unittest.TestCase):
             with self.subTest(invalid=invalid):
                 with self.assertRaisesRegex(ValueError, "header value"):
                     Headers({"X-Test": invalid})
+
+    def test_request_splits_raw_target_and_keeps_captures_immutable(self) -> None:
+        request = Request(
+            "GET",
+            "/items?tag=a%2Fb&empty=",
+            Headers(),
+            path_params={"item_id": "a%2Fb"},
+            route_pattern=r"/items/(?P<item_id>[^/]+)",
+        )
+        self.assertEqual(request.raw_target, "/items?tag=a%2Fb&empty=")
+        self.assertEqual(request.path, "/items")
+        self.assertEqual(request.query_string, "tag=a%2Fb&empty=")
+        self.assertIsInstance(request.path_params, MappingProxyType)
+        with self.assertRaises(TypeError):
+            request.path_params["item_id"] = "changed"  # type: ignore[index]
+
+    def test_request_rejects_inconsistent_explicit_target_fields(self) -> None:
+        with self.assertRaisesRegex(ValueError, "inconsistent"):
+            Request("GET", "/one", Headers(), raw_target="/two")
+
+    def test_request_can_be_built_from_separate_path_and_query(self) -> None:
+        request = Request("GET", "/items", Headers(), query_string="page=2")
+        self.assertEqual(request.raw_target, "/items?page=2")
+        self.assertEqual(request.path, "/items")
+        self.assertEqual(request.query_string, "page=2")
