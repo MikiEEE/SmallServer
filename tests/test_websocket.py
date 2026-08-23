@@ -871,19 +871,23 @@ class WebSocketLoopbackTests(unittest.TestCase):
             response = b""
             while b"\r\n\r\n" not in response:
                 response += stream.recv(4096)
-            return stream, response
+            headers, separator, websocket_data = response.partition(b"\r\n\r\n")
+            return stream, headers + separator, websocket_data
 
         def client_work() -> None:
             try:
-                stream, response = connect("/handshake-timeout")
+                stream, response, _ = connect("/handshake-timeout")
                 outcomes["handshake"] = response
                 stream.close()
 
-                stream, response = connect("/idle-timeout")
+                stream, response, websocket_data = connect("/idle-timeout")
                 outcomes["idle_handshake"] = response
                 idle_client = api.Connection(api.ConnectionType.CLIENT)
                 idle_events = _receive_events(
-                    stream, idle_client, api.CloseConnection
+                    stream,
+                    idle_client,
+                    api.CloseConnection,
+                    initial_data=websocket_data,
                 )
                 idle_close = next(
                     event
@@ -894,23 +898,37 @@ class WebSocketLoopbackTests(unittest.TestCase):
                 stream.sendall(idle_client.send(idle_close.response()))
                 stream.close()
 
-                stream, response = connect("/pong-timeout")
+                stream, response, websocket_data = connect("/pong-timeout")
                 outcomes["pong_handshake"] = response
                 pong_client = api.Connection(api.ConnectionType.CLIENT)
-                ping_events = _receive_events(stream, pong_client, api.Ping)
+                ping_events = _receive_events(
+                    stream,
+                    pong_client,
+                    api.Ping,
+                    initial_data=websocket_data,
+                )
                 outcomes["ping_payload"] = next(
                     event.payload
                     for event in ping_events
                     if isinstance(event, api.Ping)
                 )
-                close_events = _receive_events(
-                    stream, pong_client, api.CloseConnection
-                )
                 pong_close = next(
-                    event
-                    for event in close_events
-                    if isinstance(event, api.CloseConnection)
+                    (
+                        event
+                        for event in ping_events
+                        if isinstance(event, api.CloseConnection)
+                    ),
+                    None,
                 )
+                if pong_close is None:
+                    close_events = _receive_events(
+                        stream, pong_client, api.CloseConnection
+                    )
+                    pong_close = next(
+                        event
+                        for event in close_events
+                        if isinstance(event, api.CloseConnection)
+                    )
                 outcomes["pong_code"] = pong_close.code
                 stream.sendall(pong_client.send(pong_close.response()))
                 stream.close()
