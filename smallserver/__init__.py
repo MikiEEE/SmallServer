@@ -10,6 +10,7 @@ from .errors import (
     ServerStartupError,
 )
 from .http import Headers, Request, Response
+from .http2 import HTTP2Config
 from .routing import (
     RegexRouteConfig,
     RegexRoutesUnavailable,
@@ -48,6 +49,7 @@ __all__ = [
     "AdapterShutdownError",
     "Headers",
     "HTTPError",
+    "HTTP2Config",
     "ManagedRuntimeConfig",
     "RegexRouteConfig",
     "RegexRoutesUnavailable",

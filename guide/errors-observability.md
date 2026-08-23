@@ -13,6 +13,19 @@ The network server converts ordinary handler exceptions into a generic 500.
 `app.dispatch()` only catches `HTTPError`, so direct dispatch in tests preserves
 programming errors.
 
+On HTTP/1.1 and HTTP/2 listeners, a regex match timeout becomes a generic 500.
+A direct `await app.dispatch(request)` instead raises `RouteMatchTimeout`. If a
+network listener has an observer configured, SmallServer attempts to enqueue at
+most one immutable, traceback-free `RouteErrorEvent` containing only an opaque
+route ID and category. Delivery is bounded and scheduler-local, so saturation,
+signal failure, or shutdown may drop the event. Dropped events and observer
+callback failures are reported by the corresponding `ServerHandle` counters.
+
+Ordinary WebSocket handler failures are converted to a sanitized 1011 Close
+frame after an accepted handshake. `KeyboardInterrupt` and `SystemExit`
+preserve their identity. Protocol, capacity, deadline, and disconnect outcomes
+use the typed WebSocket exceptions documented in [WebSockets](websockets.md).
+
 ## Configuration errors
 
 `ServerConfigurationError` reports a runtime or kernel capability that cannot
@@ -49,9 +62,3 @@ Observe these stable properties:
 SmallServer does not provide a logging backend, metrics registry, or tracing
 system. Applications should report sanitized handle state and
 their own handler/adapter telemetry without reaching into private attributes.
-
-Regex matching timeouts may be reported through `route_error_observer`. Its
-dedicated SmallOS task receives bounded, traceback-free `RouteErrorEvent`
-values containing only an opaque route ID and category. Observer failures and
-capacity drops are isolated and counted on `ServerHandle`; the observer must
-return quickly and use an execution adapter for blocking work.

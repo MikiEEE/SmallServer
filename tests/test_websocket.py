@@ -1126,8 +1126,14 @@ class WebSocketLoopbackTests(unittest.TestCase):
                     response = b""
                     while b"\r\n\r\n" not in response:
                         response += stream.recv(4096)
+                    _, _, websocket_data = response.partition(b"\r\n\r\n")
                     client = api.Connection(api.ConnectionType.CLIENT)
-                    events = _receive_events(stream, client, api.CloseConnection)
+                    events = _receive_events(
+                        stream,
+                        client,
+                        api.CloseConnection,
+                        initial_data=websocket_data,
+                    )
                     close_events.extend(events)
                     close_event = next(
                         event
@@ -1155,11 +1161,13 @@ class WebSocketLoopbackTests(unittest.TestCase):
         self.assertTrue(server.finished)
 
 
-def _receive_events(stream, connection, event_type):
+def _receive_events(stream, connection, event_type, *, initial_data=b""):
     deadline = time.monotonic() + 3
     received = []
+    pending = initial_data
     while time.monotonic() < deadline:
-        data = stream.recv(4096)
+        data = pending or stream.recv(4096)
+        pending = b""
         if not data:
             return received
         connection.receive_data(data)

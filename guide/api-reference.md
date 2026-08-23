@@ -11,13 +11,16 @@ omit overload detail where prose is clearer.
   decorators for one supported method.
 - `route(path, methods)` — atomic multi-method route decorator.
 - `get_regex`, `post_regex`, `put_regex`, `patch_regex`, `delete_regex`, and
-  `route_regex` — optional timeout-bounded full-path route decorators.
-- `websocket(path, *, origins=None, subprotocols=())` — static WebSocket route.
+  `route_regex(pattern, methods)` — optional timeout-bounded regex decorators.
+- `websocket(path, *, origins=None, subprotocols=())` — static HTTP/1.1
+  WebSocket Upgrade decorator.
 - `async dispatch(request)` — dispatch an existing `Request`.
-- `listen(host="127.0.0.1", port=8000, config=None, *, runtime=None, start=None)`
+- `listen(host="127.0.0.1", port=8000, config=None, *, protocol="http1",`
+  `http2_config=None, runtime=None, start=None)`
   — managed blocking lifecycle or caller-owned scheduling/startup.
-- `serve(runtime, host="127.0.0.1", port=8000, config=None)` — schedule against
-  a caller-owned runtime and return immediately.
+- `serve(runtime, host="127.0.0.1", port=8000, config=None, *,`
+  `protocol="http1", http2_config=None)` — schedule against a caller-owned
+  runtime and return immediately.
 
 ## HTTP values
 
@@ -25,10 +28,10 @@ omit overload detail where prose is clearer.
 
 Immutable, case-insensitive mapping with `items()` and `get()`.
 
-### `Request(method, path, headers, body=b"", version="HTTP/1.1", ...)`
+### `Request(method, path, headers, body=b"", version="HTTP/1.1")`
 
-Frozen request value with validated method, routed path, headers, byte body,
-raw target, query string, immutable path parameters, and route pattern.
+Frozen request value with validated method, path, headers, and byte body, plus
+`raw_target`, `query_string`, immutable `path_params`, and `route_pattern`.
 
 ### `Response(status=200, body=b"", headers=Headers())`
 
@@ -41,23 +44,34 @@ provide common construction and serialization paths.
 
 Frozen finite-limit configuration. See [Configuration](configuration.md).
 
+### `ManagedRuntimeConfig(...)`
+
+Frozen SmallOS settings used only when `listen()` creates the runtime. A
+caller-supplied runtime retains its own configuration.
+
+### `HTTP2Config(...)`
+
+Optional cleartext HTTP/2 stream, buffer, frame-batch, and timeout limits. See
+[Cleartext HTTP/2](http2.md). Constructing a listener with `protocol="http2"`
+requires the `smallserver[http2]` extra.
+
 ### `ServerHandle`
 
 Read-only properties: `address`, `port`, `closed`, `failure`, `finished`,
-`cleanup_errors`, and `owned_connection_count`.
+`cleanup_errors`, `owned_connection_count`, `dropped_route_error_events`, and
+`route_observer_failures`.
 
 Operations: `close()`, `async close_from_task(task)`, and `finalize()`.
 
-## Regex routing
+### `RegexRouteConfig(...)`
 
-- `RegexRouteConfig` — finite route, pattern, capture, path, and timeout limits.
-- `RegexRoutesUnavailable` — the optional matching engine is missing.
-- `RouteMatchTimeout` and `RoutePathTooLarge` — bounded matching failures.
-- `RouteErrorEvent` — sanitized event sent to the optional observer.
+Finite optional-regex limits. `RouteErrorEvent`, `RouteMatchTimeout`,
+`RoutePathTooLarge`, and `RegexRoutesUnavailable` describe its bounded error
+surface. Runtime regex matching requires `smallserver[regex-routes]`.
 
 ## WebSockets
 
-- `WebSocketConfig` — finite frame, message, mailbox, connection, and deadline
+- `WebSocketConfig` — finite connection, frame, message, mailbox, and deadline
   limits.
 - `WebSocket` — `accept`, `reject`, receive/send methods, `ping`, `close`,
   iteration, `request`, and negotiated `subprotocol`.

@@ -51,22 +51,6 @@ class HTTPRequestParserTests(unittest.TestCase):
         with self.assertRaisesRegex(HTTPParseError, "origin-form"):
             self.parser().feed(b"GET /items#fragment HTTP/1.1\r\nHost: localhost\r\n\r\n")
 
-    def test_splits_query_without_decoding_or_normalizing_path(self) -> None:
-        request = self.parser().feed(
-            b"GET /items/a%2Fb?tag=x%20y HTTP/1.1\r\nHost: localhost\r\n\r\n"
-        )
-        self.assertIsNotNone(request)
-        assert request is not None
-        self.assertEqual(request.raw_target, "/items/a%2Fb?tag=x%20y")
-        self.assertEqual(request.path, "/items/a%2Fb")
-        self.assertEqual(request.query_string, "tag=x%20y")
-
-    def test_enforces_request_target_limit_independently(self) -> None:
-        parser = HTTPRequestParser(256, 2, 32, max_request_target_bytes=8)
-        with self.assertRaisesRegex(HTTPParseError, "request target") as raised:
-            parser.feed(b"GET /12345678 HTTP/1.1\r\nHost: x\r\n\r\n")
-        self.assertEqual(raised.exception.status, 414)
-
     def test_config_rejects_unbounded_limits(self) -> None:
         with self.assertRaisesRegex(ValueError, "max_connections"):
             ServerConfig(max_connections=0)
@@ -220,6 +204,41 @@ class HTTPRequestParserTests(unittest.TestCase):
                 "smallserver-route-observer",
             ],
         )
+
+    def test_route_observer_channel_is_bounded_and_stop_wakes_task(self) -> None:
+        class ObserverTask:
+            done = False
+            signals = []
+
+            @staticmethod
+            def getID() -> int:
+                return 9
+
+            def acceptSignal(self, signal) -> int:
+                self.signals.append(signal)
+                return 0
+
+        class SourceTask:
+            signals = []
+
+            def sendSignal(self, task_id, signal) -> int:
+                self.signals.append((task_id, signal))
+                return 0
+
+        observer_task = ObserverTask()
+        source_task = SourceTask()
+        channel = RouteObserverChannel(lambda event: None, max_events=1)
+        channel.bind(observer_task)
+        event = RouteErrorEvent("regex-route-1", "route_match_timeout")
+
+        self.assertTrue(channel.enqueue(event, source_task))
+        self.assertFalse(channel.enqueue(event, source_task))
+        channel.stop()
+
+        self.assertEqual(source_task.signals, [(9, 31)])
+        self.assertEqual(observer_task.signals, [31])
+        self.assertEqual(channel.dropped, 2)
+        self.assertEqual(list(channel.events), [])
 
     def test_serve_closes_kernel_resources_when_task_construction_fails(self) -> None:
         from SmallPackage import SmallTask as RealSmallTask

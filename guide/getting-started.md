@@ -11,9 +11,6 @@ python3 -m pip install -r requirements.txt
 python3 -m pip install -e .
 ```
 
-Install `.[regex-routes]` for regex routes or `.[websocket]` for WebSocket
-routes. Static HTTP usage imports without either optional package.
-
 The first command needs Git and network access. Pin the SmallOS revision in
 your own deployment lock or build process if reproducibility matters.
 
@@ -52,7 +49,7 @@ use [caller-owned runtime mode](runtime-lifecycle.md#caller-owned-runtime).
 ## Try the task demo
 
 [`demo.py`](../demo.py) implements GET, POST, PUT, PATCH, and DELETE on the
-static `/tasks` route plus a WebSocket echo route at `/ws`:
+static `/tasks` route:
 
 ```console
 python3 demo.py
@@ -61,6 +58,6 @@ curl -i -X POST -H 'Content-Type: application/json' \
   --data '{"title":"read the guide"}' http://127.0.0.1:8000/tasks
 ```
 
-Every ordinary HTTP/1.1 connection serves one request and closes after the
-response. See [Routing](routing.md), [WebSockets](websockets.md), and
-[Configuration](configuration.md) before building a larger application.
+Every current HTTP/1.1 connection serves one request and closes after the
+response. See [Routing](routing.md) and [Configuration](configuration.md) before
+building a larger application.
