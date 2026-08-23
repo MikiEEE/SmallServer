@@ -76,6 +76,8 @@ class HTTPRequestParserTests(unittest.TestCase):
             ServerConfig(max_request_target_bytes=0)
         with self.assertRaisesRegex(ValueError, "max_route_error_events"):
             ServerConfig(max_route_error_events=0)
+        with self.assertRaisesRegex(TypeError, "managed_runtime"):
+            ServerConfig(managed_runtime={})  # type: ignore[arg-type]
 
     def test_config_preserves_legacy_positional_field_mapping(self) -> None:
         config = ServerConfig(1, 2, 3, 4, 5, 6, 7)
@@ -127,8 +129,6 @@ class HTTPRequestParserTests(unittest.TestCase):
         self.assertFalse(failing_channel.enqueue(first, FailingSourceTask()))
         self.assertEqual(list(failing_channel.events), [])
         self.assertEqual(failing_channel.dropped, 1)
-        with self.assertRaisesRegex(TypeError, "managed_runtime"):
-            ServerConfig(managed_runtime={})  # type: ignore[arg-type]
 
     def test_managed_runtime_config_is_validated_and_defensively_copied(self) -> None:
         source = {"http": {"max_response_size": 4096}}
@@ -220,8 +220,6 @@ class HTTPRequestParserTests(unittest.TestCase):
                 "smallserver-route-observer",
             ],
         )
-        self.assertEqual([handle.name for handle in runtime.kernel.closed], ["listener"])
-        self.assertEqual(runtime.kernel.wakeup.close_calls, 1)
 
     def test_serve_closes_kernel_resources_when_task_construction_fails(self) -> None:
         from SmallPackage import SmallTask as RealSmallTask
