@@ -4,17 +4,20 @@ import threading
 import unittest
 
 from SmallPackage import SmallOS, SmallTask, Unix
-from SmallPackage.adapters.asyncio_loop import AsyncioAdapter
-from SmallPackage.adapters.errors import AdapterCapacityError, AdapterProtocolError
-from SmallPackage.adapters.threads import ThreadAdapter
 
+import smallserver
 from smallserver import (
+    AdapterCapacityError,
+    AdapterError,
+    AdapterProtocolError,
     AdapterRegistry,
     AdapterShutdownError,
+    AsyncioAdapter,
     Headers,
     Request,
     Response,
     SmallServer,
+    ThreadAdapter,
     http_error_from_adapter,
 )
 
@@ -36,6 +39,33 @@ class FakeAdapter:
 
 
 class AdapterRegistryTests(unittest.TestCase):
+    def test_public_facade_exposes_adapter_types_and_errors(self) -> None:
+        expected_exports = {
+            "AdapterCancelledError",
+            "AdapterCapacityError",
+            "AdapterClosedError",
+            "AdapterError",
+            "AdapterExecutionError",
+            "AdapterProtocolError",
+            "AdapterUnavailableError",
+            "AsyncioAdapter",
+            "ThreadAdapter",
+        }
+        self.assertLessEqual(expected_exports, set(smallserver.__all__))
+        for name in expected_exports:
+            self.assertIsNotNone(getattr(smallserver, name))
+        self.assertIs(smallserver.ThreadAdapter, ThreadAdapter)
+        self.assertIs(smallserver.AsyncioAdapter, AsyncioAdapter)
+        blocking = ThreadAdapter(max_workers=1, max_pending=1)
+        foreign_async = AsyncioAdapter(max_pending=1)
+        try:
+            self.assertIsInstance(AdapterCapacityError("full"), AdapterError)
+            self.assertFalse(blocking.closed)
+            self.assertFalse(foreign_async.closed)
+        finally:
+            foreign_async.shutdown()
+            blocking.shutdown()
+
     def test_registry_delegates_and_shuts_down_in_reverse_order(self) -> None:
         events: list[str] = []
         first = FakeAdapter(events, "first")

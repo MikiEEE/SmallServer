@@ -7,10 +7,10 @@ import time
 import unittest
 
 from SmallPackage import SmallOS, Unix
-from SmallPackage.adapters.threads import ThreadAdapter
 
 from smallserver import (
     AdapterRegistry,
+    ThreadAdapter,
     RegexRouteConfig,
     Request,
     Response,

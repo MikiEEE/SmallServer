@@ -1,8 +1,9 @@
 # Third-party adapters
 
 SmallServer handlers run on the SmallOS scheduler and must not call blocking
-functions or drive a second event loop directly. SmallOS supplies explicit
-escape hatches:
+functions or drive a second event loop directly. SmallServer exposes the
+SmallOS-backed escape hatches through its own public API, so application code
+does not need to import adapter modules from `SmallPackage`:
 
 - `ThreadAdapter` for blocking or thread-affine callables;
 - `AsyncioAdapter` for coroutine-based libraries on a persistent asyncio loop.
@@ -11,9 +12,13 @@ The application creates, bounds, and shuts down these adapters. SmallServer
 does not create adapter workers as a side effect of `listen()`.
 
 ```python
-from SmallPackage.adapters.errors import AdapterError
-from SmallPackage.adapters.threads import ThreadAdapter
-from smallserver import AdapterRegistry, Response, http_error_from_adapter
+from smallserver import (
+    AdapterError,
+    AdapterRegistry,
+    Response,
+    ThreadAdapter,
+    http_error_from_adapter,
+)
 
 services = AdapterRegistry(blocking=ThreadAdapter(max_workers=2, max_pending=8))
 
@@ -38,6 +43,12 @@ work when its body exits with an exception.
 and `shutdown()`. It rejects duplicate names and duplicate adapter objects,
 delegates calls, exposes stable registration order through `names()` and
 `items()`, and shuts adapters down in reverse registration order.
+
+Import `ThreadAdapter` and `AsyncioAdapter` from `smallserver`. Their work is
+still scheduled and completed through SmallOS, but the backend module layout is
+not part of application code. SmallServer also exports `AdapterError` and its
+capacity, unavailable, closed, cancelled, protocol, and execution subclasses
+for explicit handling.
 
 `http_error_from_adapter()` intentionally sanitizes adapter failures:
 capacity, unavailable, closed, and cancelled conditions become generic 503
