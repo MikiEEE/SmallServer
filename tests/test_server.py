@@ -188,6 +188,39 @@ class HTTPRequestParserTests(unittest.TestCase):
         self.assertEqual([handle.name for handle in runtime.kernel.closed], ["listener"])
         self.assertEqual(runtime.kernel.wakeup.close_calls, 1)
 
+    def test_observer_task_is_owned_by_startup_rollback(self) -> None:
+        class Runtime:
+            def __init__(self) -> None:
+                self.kernel = FakeKernel()
+                self.tasks = []
+                self.cancelled = []
+
+            def fork(self, tasks) -> None:
+                self.tasks = list(tasks)
+                raise RuntimeError("no task capacity")
+
+            def cancel_task(self, task) -> None:
+                self.cancelled.append(task)
+                task.cancel()
+
+            def resume_task(self, task) -> None:
+                pass
+
+        runtime = Runtime()
+        app = SmallServer(route_error_observer=lambda event: None)
+        with self.assertRaisesRegex(RuntimeError, "capacity"):
+            app.serve(runtime)
+
+        self.assertEqual(runtime.cancelled, runtime.tasks)
+        self.assertEqual(
+            [task.name for task in runtime.tasks],
+            [
+                "smallserver-listener",
+                "smallserver-close-watcher",
+                "smallserver-route-observer",
+            ],
+        )
+
     def test_serve_closes_kernel_resources_when_task_construction_fails(self) -> None:
         from SmallPackage import SmallTask as RealSmallTask
 

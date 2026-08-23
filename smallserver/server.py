@@ -142,9 +142,9 @@ class ServerConfig:
     listener_priority: int = 1
     connection_priority: int = 2
     accept_batch_size: int = 16
-    managed_runtime: ManagedRuntimeConfig | None = None
     max_request_target_bytes: int = 8 * 1024
     max_route_error_events: int = 16
+    managed_runtime: ManagedRuntimeConfig | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -205,10 +205,12 @@ class RouteObserverChannel:
         self.accepting = False
         self.dropped += len(self.events)
         self.events.clear()
-        if self.task is not None:
-            accept_signal = getattr(self.task, "acceptSignal", None)
-            if callable(accept_signal):
-                accept_signal(_ROUTE_OBSERVER_SIGNAL)
+        task = self.task
+        if task is not None and not getattr(task, "done", False):
+            try:
+                task.acceptSignal(_ROUTE_OBSERVER_SIGNAL)
+            except BaseException:
+                pass
 
 
 async def run_route_observer(task: Any, channel: RouteObserverChannel) -> None:
@@ -247,6 +249,7 @@ class ServerHandle:
         self._listener = listener
         self._wakeup = wakeup
         self._config = config
+        self._route_observer_channel = route_observer_channel
         self._address = transport.local_address(listener)
         self._on_finalized = on_finalized
         self._close_requested = False
@@ -255,7 +258,6 @@ class ServerHandle:
         self._finished = False
         self._failure: BaseException | None = None
         self._cleanup_errors: dict[str, BaseException] = {}
-        self._route_observer_channel = route_observer_channel
         self._listener_task: Any = None
         self._listener_resumed = False
         self._close_task: Any = None
@@ -414,7 +416,7 @@ class ServerHandle:
             if callable(request_shutdown):
                 request_shutdown()
         channel = self._route_observer_channel
-        if channel is not None and channel.accepting:
+        if channel is not None:
             channel.stop()
         if self._wakeup is not None and not self._wakeup.closed:
             try:

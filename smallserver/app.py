@@ -160,6 +160,7 @@ class SmallServer:
         if route_error_observer is not None and not callable(route_error_observer):
             raise TypeError("route_error_observer must be callable or None")
         self._router = Router(regex_config)
+        self._routes = self._router._static
         self._route_error_observer = route_error_observer
         if websocket_config is not None and not isinstance(
             websocket_config, WebSocketConfig
@@ -395,9 +396,8 @@ class SmallServer:
     def _handle_cleanup_transaction(handle: ServerHandle) -> _CleanupTransaction:
         return _HandleCleanupTransaction(handle)
 
-    @staticmethod
     def _resolve_server_config(
-        config: ServerConfig | None, *, managed: bool
+        self, config: ServerConfig | None, *, managed: bool
     ) -> ServerConfig:
         if config is not None and not isinstance(config, ServerConfig):
             raise TypeError("config must be a ServerConfig or None")
@@ -418,11 +418,14 @@ class SmallServer:
                     "server task priorities must be lower than managed runtime "
                     "priority_levels"
                 )
-            required_tasks = resolved.max_connections + 2
+            control_tasks = 3 if self._route_error_observer is not None else 2
+            required_tasks = resolved.max_connections + control_tasks
             if effective_runtime_config.task_capacity < required_tasks:
                 raise ValueError(
                     "managed runtime task_capacity must be at least "
-                    "max_connections + 2 for listener and shutdown tasks"
+                    "max_connections + {} for server control tasks".format(
+                        control_tasks
+                    )
                 )
         return resolved
 
@@ -504,14 +507,14 @@ class SmallServer:
         def release(completed: ServerHandle) -> None:
             self._release_invocation(completed)
 
-        observer_channel = (
-            RouteObserverChannel(
-                self._route_error_observer, config.max_route_error_events
-            )
-            if self._route_error_observer is not None
-            else None
-        )
         try:
+            observer_channel = (
+                RouteObserverChannel(
+                    self._route_error_observer, config.max_route_error_events
+                )
+                if self._route_error_observer is not None
+                else None
+            )
             handle = ServerHandle(
                 runtime,
                 transport,
