@@ -33,22 +33,87 @@ It owns scheduling, socket readiness, and foreign execution adapters.
 
 ## Run the demo
 
-The included demo binds an ephemeral loopback TCP port, starts the SmallOS
-runtime, and uses a separate loopback client to exercise the real listener.
+The included demo starts a task API at `http://127.0.0.1:8000`. Common
+application code does not need to import or configure SmallOS.
 
 ```bash
 python3 -m pip install -r requirements.txt
 python3 demo.py
 ```
 
-It exercises POST, GET, PATCH, PUT, DELETE, and a 404 response. The static
-`/tasks` path is intentional: path parameters arrive with a later milestone.
+Leave the process running and exercise GET, POST, PUT, PATCH, and DELETE from a
+browser or HTTP client. Press Ctrl-C for deterministic cleanup without a
+traceback. The static `/tasks` path is intentional: path parameters arrive
+with a later milestone.
 
 ## Bind a server
 
-Create the application, bind it to a SmallOS runtime, then start that runtime.
-`port=0` asks the operating system for an available port, which is useful in
-tests and local tooling.
+Create the application and call blocking `listen()`. It lazily creates a
+SmallOS runtime with the Unix kernel, while SmallOS remains the scheduler and
+owner of socket readiness. `port=0` asks the operating system for an available
+port, which is useful in tests and local tooling.
+
+```python
+from smallserver import Response, SmallServer
+
+app = SmallServer()
+
+@app.get("/health")
+async def health(request):
+    return Response.json({"status": "ok"})
+
+app.listen(host="127.0.0.1", port=8000)
+```
+
+### Configure the managed SmallOS runtime
+
+When `listen()` creates the runtime, `ServerConfig.managed_runtime` passes the
+relevant scheduler and client defaults into SmallOS before the listener binds:
+
+```python
+from smallserver import ManagedRuntimeConfig, ServerConfig
+
+config = ServerConfig(
+    max_connections=200,
+    managed_runtime=ManagedRuntimeConfig(
+        task_capacity=512,
+        priority_levels=8,
+        io_buffer_length=2048,
+        eternal_watchers=False,
+        client_defaults={
+            "http": {"max_response_size": 8 * 1024 * 1024},
+        },
+    ),
+)
+
+app.listen(host="127.0.0.1", port=8000, config=config)
+```
+
+This bridge is only for SmallServer-owned runtimes. If you supply `runtime=`,
+configure it directly with `SmallOS(config=...)`; SmallServer rejects
+`managed_runtime` rather than mutating caller-owned scheduler state.
+`task_capacity` must reserve at least `max_connections + 2` task slots for the
+listener and shutdown-control tasks, and both server task priorities must be
+below `priority_levels`.
+
+Managed `listen()` blocks and catches Ctrl-C after closing its listener, wakeup
+channel, connections, and server tasks. It returns the closed `ServerHandle`,
+whose cached `address` and `port` remain available for diagnostics. Each
+current connection accepts one request and sends a `Connection: close`
+response.
+
+If the runtime exits normally but cleanup is incomplete, `listen()` raises
+`ServerFinalizationError`; retain it and call `retry_cleanup()` until it
+succeeds. If runtime startup raises while cleanup is incomplete, ordinary
+failures are wrapped by `ServerStartupError`; `KeyboardInterrupt` and
+`SystemExit` keep their identity and expose that cleanup owner as `__cause__`.
+Until cleanup succeeds, the application rejects another listener invocation.
+
+## Advanced runtime control
+
+Supply a configured runtime when the application needs to coordinate other
+SmallOS tasks. A supplied runtime is never reconfigured or destroyed, and
+`start=False` schedules the server without starting it:
 
 ```python
 from SmallPackage import SmallOS, Unix
@@ -61,13 +126,68 @@ app = SmallServer()
 async def health(request):
     return Response.json({"status": "ok"})
 
-server = app.serve(runtime, host="127.0.0.1", port=8000)
-runtime.start()
+server = app.listen(runtime=runtime, start=False)
+try:
+    runtime.start()
+finally:
+    server.finalize()
 ```
 
-Call `server.close()` from another thread or client-control path to request a
-scheduler-safe shutdown. Each current connection accepts one request and sends
-a `Connection: close` response.
+On a kernel with `supports_wakeup_channel() == True`, call `server.close()`
+from another thread or client-control path to request scheduler-safe shutdown.
+`Unix` provides this cross-thread wakeup capability.
+
+Constrained kernels may support TCP servers without supporting a thread-safe
+wakeup channel. On those kernels, `server.close()` raises instead of mutating
+runtime state from an unsafe context. A currently running SmallOS task can use
+`await server.close_from_task(task)` to close on the scheduler thread. The
+handle's `finished` property becomes true only after the listener, every
+connection, and the wakeup channel have closed successfully; `cleanup_errors`
+reports close failures that remain available for a later scheduler-side retry.
+
+If startup fails and the kernel also fails to release an acquired listener or
+wakeup resource, `serve()` raises `ServerStartupError`. Its `primary_error`
+preserves the startup failure and `cleanup_errors` reports the outstanding
+cleanup attempts without exposing kernel handles. Keep the exception and call
+`retry_cleanup()` (or `finalize()`) until it returns `True`; later calls remain
+safe and return `True`. `KeyboardInterrupt` and `SystemExit` are always
+re-raised as the identical exception; when rollback is incomplete, their
+`__cause__` is the `ServerStartupError` cleanup owner. Abandoning an incomplete
+startup error performs one best-effort cleanup retry and emits a
+`ResourceWarning` if resources remain owned.
+
+`max_connections` bounds every connection stream still owned by the server,
+including streams retained after a failed close. At capacity the listener
+blocks on a SmallOS scheduler signal without polling or accepting another
+connection; releasing capacity signals the listener. Any connection close
+failure is fatal and stops further acceptance while retaining the stream for
+an explicit shutdown-cleanup retry.
+
+Each current connection accepts one request and sends a `Connection: close`
+response.
+
+`app.serve(runtime, ...)` remains the equivalent schedule-and-return
+compatibility API. `listen(runtime=runtime, start=True)` starts the supplied
+runtime exactly once and finalizes only server-owned resources when it exits;
+the runtime itself still belongs to the caller.
+
+While the scheduler is running on a kernel with a wakeup channel,
+`server.close()` is the thread-safe shutdown signal. Kernels without that
+capability must call `await server.close_from_task(task)` from their currently
+running SmallOS task. After a manually started scheduler has already exited or
+failed, `server.finalize()` is the idempotent owner-thread cleanup operation on
+either kind of kernel.
+
+Execution adapters are likewise application-owned. Construct and close them
+around the runtime lifecycle rather than expecting managed `listen()` to
+create or stop adapter threads or asyncio loops. See
+[`examples/manual_runtime.py`](examples/manual_runtime.py) for the complete
+manual shape.
+
+Only one listener invocation can be active on an application at a time. Once
+its handle reports `finished`, all retained cleanup has completed and the same
+application can listen again. A failed cleanup attempt keeps the invocation
+reserved until a later successful retry.
 
 ## Define routes
 
