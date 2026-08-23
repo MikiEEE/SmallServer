@@ -242,6 +242,8 @@ class ServerHandle:
         wakeup: WakeupChannel | None,
         config: ServerConfig,
         on_finalized: Callable[[ServerHandle], None] | None = None,
+        protocol: str = "http1",
+        protocol_config: Any = None,
         route_observer_channel: RouteObserverChannel | None = None,
     ) -> None:
         self._runtime = runtime
@@ -249,6 +251,8 @@ class ServerHandle:
         self._listener = listener
         self._wakeup = wakeup
         self._config = config
+        self._protocol = protocol
+        self._protocol_config = protocol_config
         self._route_observer_channel = route_observer_channel
         self._address = transport.local_address(listener)
         self._on_finalized = on_finalized
@@ -268,6 +272,8 @@ class ServerHandle:
         self._pending_task_cancellations: dict[int, Any] = {}
         self._websocket_states: dict[int, Any] = {}
         self._capacity_waiting = False
+        self._graceful_connections: set[int] = set()
+        self._graceful_closers: dict[int, Callable[[], None]] = {}
 
     @property
     def address(self) -> tuple[str, int]:
@@ -448,6 +454,7 @@ class ServerHandle:
                 self._cancelled_task_ids.add(identity)
 
         for identity, (connection, task) in list(self._connections.items()):
+            graceful_requested = False
             websocket_owned = identity in self._websocket_states
             if owner_thread:
                 if (
@@ -459,15 +466,29 @@ class ServerHandle:
                     if self._cancel_or_retain_task(task):
                         self._cancelled_task_ids.add(id(task))
             elif task is not current_task:
-                try:
-                    self._runtime.resume_task(task)
-                except BaseException:
-                    pass
+                closer = self._graceful_closers.get(identity)
+                if closer is not None:
+                    try:
+                        closer()
+                        graceful_requested = True
+                    except BaseException:
+                        try:
+                            self._runtime.resume_task(task)
+                        except BaseException:
+                            pass
+                else:
+                    try:
+                        self._runtime.resume_task(task)
+                    except BaseException:
+                        pass
                 if websocket_owned:
                     # The live coordinator owns its bounded Close handshake
                     # and releases the stream through _connection_finished().
-                    continue
-            if task is not current_task:
+                    graceful_requested = True
+            if (
+                task is not current_task
+                and not (not owner_thread and graceful_requested)
+            ):
                 self._connections.pop(identity, None)
                 self._close_or_retain(connection, current_task)
 
@@ -516,11 +537,24 @@ class ServerHandle:
             self._closing_connections.pop(identity, None)
             self._cleanup_errors.pop("connection:{}".format(identity), None)
             return True
-        self._closing_connections[identity] = connection
+        if identity not in self._connections:
+            self._closing_connections[identity] = connection
         error = connection.close_error or RuntimeError("kernel connection close failed")
         self._cleanup_errors["connection:{}".format(identity)] = error
         self._connection_close_failed(error, task, primary_error)
         return False
+
+    def _force_connection_close(
+        self,
+        connection: TransportHandle,
+        task: Any = None,
+        primary_error: BaseException | None = None,
+    ) -> bool:
+        """Stop graceful handling and close through retryable ownership."""
+        identity = id(connection)
+        self._graceful_connections.discard(identity)
+        self._graceful_closers.pop(identity, None)
+        return self._close_or_retain(connection, task, primary_error)
 
     def _connection_close_failed(
         self,
@@ -580,6 +614,8 @@ class ServerHandle:
         """Release a completed connection without losing failed-close ownership."""
         previous_count = self.owned_connection_count
         entry = self._connections.pop(id(connection), None)
+        self._graceful_connections.discard(id(connection))
+        self._graceful_closers.pop(id(connection), None)
         owned_task = entry[1] if entry is not None else task
         if owned_task in self._owned_tasks:
             self._owned_tasks.remove(owned_task)
