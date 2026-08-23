@@ -1,8 +1,8 @@
 # Routing
 
-SmallServer checks exact static routes first, then optional timeout-bounded
-regular-expression routes. Register static routes with `get`, `post`, `put`,
-`patch`, `delete`, or the multi-method `route` decorator.
+SmallServer gives exact static routes precedence, then evaluates optional
+timeout-bounded regex routes in registration order. Register static routes
+with `get`, `post`, `put`, `patch`, `delete`, or `route`.
 
 ```python
 from smallserver import Response, SmallServer
@@ -32,35 +32,23 @@ An ordinary handler exception becomes a generic 500 when the network server
 invokes it. A direct call to `await app.dispatch(request)` preserves ordinary
 exceptions for tests and embedding code.
 
-## Request targets
+## Request targets and regex routes
 
-The parser preserves the exact ASCII origin-form target as
-`request.raw_target`. Routing uses `request.path`, excluding the raw query
-string stored in `request.query_string`. Neither field nor a regex capture is
-percent-decoded, so `/files/a%2Fb` remains distinct from `/files/a/b`.
-
-## Regex routes
-
-Install the bounded matching engine only when needed:
-
-```console
-python3 -m pip install -e '.[regex-routes]'
-```
+Routing uses `request.path`; the undecoded query remains in
+`request.query_string`, and `request.raw_target` preserves both. Install
+`smallserver[regex-routes]` to register full-path expressions:
 
 ```python
-@app.get_regex(r"/users/(?P<user_id>[0-9]+)")
-async def user(request):
-    return Response.json({"user_id": request.path_params["user_id"]})
+@app.get_regex(r"/items/(?P<item_id>[0-9]+)")
+async def item(request):
+    return Response.json({"id": request.path_params["item_id"]})
 ```
 
-`route_regex(pattern, methods)` and the five method-specific regex decorators
-use full-path matching in registration order after static lookup. Only named
-captures are exposed through immutable `request.path_params`; an unmatched
-optional group is omitted. `request.route_pattern` identifies the selected
-pattern.
+Only named captures are exposed, as an immutable mapping. Patterns, paths,
+route counts, captures, individual matches, and total matching time are
+bounded by `RegexRouteConfig`. This is an explicit regex API, not automatic
+`/items/{id}` template parsing or percent decoding.
 
-Patterns must begin with a literal `/`. Registration and dispatch bound route
-count, pattern length, capture count, path bytes, each match, and total matching
-time. A timeout becomes a sanitized 500 on the network path and may be observed
-through the bounded `route_error_observer` channel without disclosing the
-hostile path. Oversized paths return 414 before matching.
+WebSocket Upgrade routes are registered separately with `app.websocket()`.
+They are exact-path HTTP/1.1 routes and may coexist with an ordinary `GET` at
+the same path. See [WebSockets](websockets.md).

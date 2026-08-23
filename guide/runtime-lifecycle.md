@@ -23,10 +23,12 @@ async def index(request):
 app.listen(host="127.0.0.1", port=8000)
 ```
 
-With no `runtime`, `listen()` lazily creates `SmallOS().setKernel(Unix())`,
-starts it, blocks until shutdown, and finalizes server-owned resources. In this
-managed mode, Ctrl-C is consumed after successful cleanup and the closed
-`ServerHandle` is returned.
+With no `runtime`, `listen()` lazily creates a configured `SmallOS` with the
+Unix kernel, starts it, blocks until shutdown, and finalizes server-owned
+resources. `ServerConfig.managed_runtime` accepts a `ManagedRuntimeConfig` for
+scheduler capacity, priority, I/O-buffer, watcher, and client-default settings.
+In this managed mode, Ctrl-C is consumed after successful cleanup and the
+closed `ServerHandle` is returned.
 
 ## Caller-owned runtime
 

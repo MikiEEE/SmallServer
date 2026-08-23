@@ -7,13 +7,8 @@ SmallServer in editable mode:
 
 ```console
 python3 -m pip install -r requirements.txt
-python3 -m pip install -e .
+python3 -m pip install -e '.[test]'
 ```
-
-Install both optional test surfaces with
-`python3 -m pip install -e '.[regex-routes,websocket]'` when validating the
-complete feature set. Also run the suite without extras to keep HTTP-only
-imports lazy.
 
 For reproducible validation, put the canonical SmallOS checkout at the front of
 `PYTHONPATH` rather than relying on an unrelated installed package named
@@ -27,10 +22,25 @@ python3 -m compileall -q smallserver demo.py examples tests
 git diff --check
 ```
 
-The suite covers routing, HTTP values and parsing, WebSockets, adapters,
-lifecycle failure ownership, kernel transport behavior, and real loopback
-serving when the local environment permits binds. Documentation tests verify
-the tracked guide set, relative Markdown links, and Python code-block syntax.
+The suite covers routing, HTTP values and parsing, adapters, lifecycle failure
+ownership, kernel transport behavior, and real loopback serving when the local
+environment permits binds. Documentation tests verify the tracked guide set,
+relative Markdown links, and Python code-block syntax.
+
+In a separate clean environment, verify the lazy optional-dependency boundary
+without installing the test or HTTP/2 extras:
+
+```console
+python3 -m pip install -r requirements.txt
+python3 -m pip install -e .
+python3 -m unittest tests.test_http2 -v
+python3 -m unittest tests.test_regex_routing -v
+python3 -m unittest tests.test_websocket -v
+```
+
+The dependency-contract tests run and optional interoperability cases skip
+cleanly; importing and testing ordinary HTTP/1.1 must require neither
+hyper-h2, regex, nor wsproto.
 
 Run the examples when their platform requirements are available:
 
@@ -41,9 +51,8 @@ python3 examples/manual_runtime.py
 python3 examples/websocket_echo.py
 ```
 
-The three network examples block until shutdown. `adapters_demo.py` completes
-on its own and demonstrates SQLite thread affinity and a persistent asyncio
-loop.
+The two network examples block until shutdown. `adapters_demo.py` completes on
+its own and demonstrates SQLite thread affinity and a persistent asyncio loop.
 
 ## Contribution boundaries
 
