@@ -9,6 +9,7 @@ from typing import Any, Callable
 from ._transport import KernelTransport, TransportHandle, WakeupChannel
 from .http import Headers, Request, Response
 from .routing import RouteErrorEvent
+from .runtime import ManagedRuntimeConfig
 
 _ROUTE_OBSERVER_SIGNAL = 31
 
@@ -133,11 +134,28 @@ class ServerConfig:
     accept_batch_size: int = 16
     max_request_target_bytes: int = 8 * 1024
     max_route_error_events: int = 16
+    managed_runtime: ManagedRuntimeConfig | None = None
 
     def __post_init__(self) -> None:
-        for name, value in self.__dict__.items():
+        for name in (
+            "max_connections",
+            "max_header_bytes",
+            "max_header_count",
+            "max_body_bytes",
+            "receive_chunk_bytes",
+            "listener_priority",
+            "connection_priority",
+            "accept_batch_size",
+            "max_request_target_bytes",
+            "max_route_error_events",
+        ):
+            value = getattr(self, name)
             if type(value) is not int or value <= 0:
                 raise ValueError("{} must be a positive integer".format(name))
+        if self.managed_runtime is not None and not isinstance(
+            self.managed_runtime, ManagedRuntimeConfig
+        ):
+            raise TypeError("managed_runtime must be a ManagedRuntimeConfig or None")
 
 
 class RouteObserverChannel:
@@ -225,6 +243,7 @@ class ServerHandle:
         self._config = config
         self._protocol = protocol
         self._protocol_config = protocol_config
+        self._route_observer_channel = route_observer_channel
         self._address = transport.local_address(listener)
         self._on_finalized = on_finalized
         self._close_requested = False
@@ -233,7 +252,6 @@ class ServerHandle:
         self._finished = False
         self._failure: BaseException | None = None
         self._cleanup_errors: dict[str, BaseException] = {}
-        self._route_observer_channel = route_observer_channel
         self._listener_task: Any = None
         self._listener_resumed = False
         self._close_task: Any = None

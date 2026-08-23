@@ -33,6 +33,7 @@ from .routing import (
     RoutePathTooLarge,
     Router,
 )
+from .runtime import ManagedRuntimeConfig
 from .server import (
     HTTPParseError,
     HTTPRequestParser,
@@ -119,7 +120,9 @@ class _StartableRuntime(_RuntimeLike, Protocol):
     def start(self) -> None: ...
 
 
-def _default_runtime_factory() -> _StartableRuntime:
+def _default_runtime_factory(
+    config: ManagedRuntimeConfig | None = None,
+) -> _StartableRuntime:
     """Lazily create the supported desktop runtime for managed ``listen``."""
     try:
         from SmallPackage import SmallOS, Unix
@@ -129,7 +132,8 @@ def _default_runtime_factory() -> _StartableRuntime:
             "install requirements.txt or supply a configured runtime"
         ) from exc
     try:
-        return SmallOS().setKernel(Unix())
+        runtime_config = None if config is None else config.to_smallos_config()
+        return SmallOS(config=runtime_config).setKernel(Unix())
     except Exception as exc:
         raise ServerConfigurationError(
             "managed listen() could not create the default SmallOS Unix runtime; "
@@ -282,6 +286,7 @@ class SmallServer:
         kernels use ``await ServerHandle.close_from_task(task)`` on the
         scheduler thread instead.
         """
+        config = self._resolve_server_config(config, managed=False)
         self._validate_runtime(runtime, require_start=False)
         return self._bind_and_schedule(
             runtime, host, port, config, protocol, http2_config
@@ -348,9 +353,12 @@ class SmallServer:
         managed = runtime is None
         if managed and start is False:
             raise ValueError("start=False requires a caller-supplied runtime")
+        config = self._resolve_server_config(config, managed=managed)
         should_start = managed if start is None else start
         if runtime is None:
-            runtime = _default_runtime_factory()
+            runtime = _default_runtime_factory(
+                config.managed_runtime or ManagedRuntimeConfig()
+            )
         self._validate_runtime(runtime, require_start=should_start)
         handle = self._bind_and_schedule(
             runtime, host, port, config, protocol, http2_config
@@ -379,6 +387,39 @@ class SmallServer:
     def _handle_cleanup_transaction(handle: ServerHandle) -> _CleanupTransaction:
         return _HandleCleanupTransaction(handle)
 
+    def _resolve_server_config(
+        self, config: ServerConfig | None, *, managed: bool
+    ) -> ServerConfig:
+        if config is not None and not isinstance(config, ServerConfig):
+            raise TypeError("config must be a ServerConfig or None")
+        resolved = config or ServerConfig()
+        runtime_config = resolved.managed_runtime
+        if not managed and runtime_config is not None:
+            raise ValueError(
+                "managed_runtime config applies only when SmallServer creates "
+                "the runtime; configure a caller-supplied SmallOS directly"
+            )
+        if managed:
+            effective_runtime_config = runtime_config or ManagedRuntimeConfig()
+            if (
+                max(resolved.listener_priority, resolved.connection_priority)
+                >= effective_runtime_config.priority_levels
+            ):
+                raise ValueError(
+                    "server task priorities must be lower than managed runtime "
+                    "priority_levels"
+                )
+            control_tasks = 3 if self._route_error_observer is not None else 2
+            required_tasks = resolved.max_connections + control_tasks
+            if effective_runtime_config.task_capacity < required_tasks:
+                raise ValueError(
+                    "managed runtime task_capacity must be at least "
+                    "max_connections + {} for server control tasks".format(
+                        control_tasks
+                    )
+                )
+        return resolved
+
     def _validate_runtime(self, runtime: object, *, require_start: bool) -> None:
         required = ["fork", "resume_task", "cancel_task"]
         if require_start:
@@ -396,7 +437,7 @@ class SmallServer:
         runtime: _RuntimeLike,
         host: str,
         port: int,
-        config: ServerConfig | None,
+        config: ServerConfig,
         protocol: str,
         http2_config: HTTP2Config | None,
     ) -> ServerHandle:
@@ -407,8 +448,6 @@ class SmallServer:
             raise ValueError("host must be a non-empty string")
         if type(port) is not int or not 0 <= port <= 65535:
             raise ValueError("port must be an integer between 0 and 65535")
-        if config is not None and not isinstance(config, ServerConfig):
-            raise TypeError("config must be a ServerConfig or None")
         if protocol not in {"http1", "http2"}:
             raise ValueError("protocol must be 'http1' or 'http2'")
         if http2_config is not None and not isinstance(http2_config, HTTP2Config):
@@ -432,16 +471,10 @@ class SmallServer:
             )
 
         try:
-            config = config or ServerConfig()
             transport = KernelTransport(runtime.kernel)
         except BaseException:
             release_marker()
             raise
-        observer_channel = (
-            RouteObserverChannel(self._route_error_observer, config.max_route_error_events)
-            if self._route_error_observer is not None
-            else None
-        )
         try:
             listener = transport.open_listener(host, port, config.max_connections)
         except _TransportAcquisitionFailure as failure:
@@ -476,6 +509,13 @@ class SmallServer:
             self._release_invocation(completed)
 
         try:
+            observer_channel = (
+                RouteObserverChannel(
+                    self._route_error_observer, config.max_route_error_events
+                )
+                if self._route_error_observer is not None
+                else None
+            )
             handle = ServerHandle(
                 runtime,
                 transport,
