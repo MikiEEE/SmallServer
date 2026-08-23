@@ -229,8 +229,8 @@ async def delete_widgets(request: Request) -> Response:
     return Response(status=204)
 ```
 
-Route paths are static in this release. Path parameters and richer lifecycle
-hooks are deferred; the current `ServerHandle` provides explicit shutdown.
+Exact static routes are dependency-free. Optional regex routes expose bounded
+named captures; automatic path-template syntax is not implemented.
 
 ## Dispatch a request
 
@@ -238,16 +238,17 @@ The listener creates requests and calls `dispatch()`. The same boundary is
 useful in application tests:
 
 ```python
-request = Request(
-    method="GET",
-    path="/health",
-    headers={"Accept": "application/json"},
-)
+async def test_health() -> None:
+    request = Request(
+        method="GET",
+        path="/health",
+        headers={"Accept": "application/json"},
+    )
 
-response = await app.dispatch(request)
-assert response.status == 200
-assert response.body == b'{"status":"ok"}'
-assert response.headers["content-type"] == "application/json"
+    response = await app.dispatch(request)
+    assert response.status == 200
+    assert response.body == b'{"status":"ok"}'
+    assert response.headers["content-type"] == "application/json"
 ```
 
 For a path that is registered but does not accept the request method,
@@ -284,9 +285,9 @@ async def delete_widget(request: Request) -> Response:
     raise HTTPError(413, "request is too large")
 ```
 
-`dispatch()` turns this into a text response with status 413. Unexpected
-exceptions are intentionally left visible for the future SmallOS server's
-runtime error handling.
+`dispatch()` turns this into a text response with status 413. Direct dispatch
+leaves unexpected exceptions visible; network listeners return a sanitized
+500 response.
 
 ## Third-party blocking and asyncio libraries
 
