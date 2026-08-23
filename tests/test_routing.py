@@ -30,6 +30,58 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 405)
         self.assertEqual(response.headers["allow"], "GET")
 
+    async def test_query_string_does_not_participate_in_static_matching(self) -> None:
+        app = SmallServer()
+        seen = []
+
+        @app.get("/items")
+        async def items(request):
+            seen.append(request)
+            return Response()
+
+        response = await app.dispatch(Request("GET", "/items?tag=a%2Fb", Headers()))
+        self.assertEqual(response.status, 200)
+        self.assertEqual(seen[0].path, "/items")
+        self.assertEqual(seen[0].query_string, "tag=a%2Fb")
+
+    async def test_static_dispatch_passes_original_request_without_route_context_copy(self) -> None:
+        app = SmallServer()
+        seen = []
+
+        @app.get("/health")
+        async def health(request):
+            seen.append(request)
+            return Response()
+
+        request = Request("GET", "/health", Headers())
+        response = await app.dispatch(request)
+        self.assertEqual(response.status, 200)
+        self.assertIs(seen[0], request)
+        self.assertIsNone(seen[0].route_pattern)
+        self.assertEqual(dict(seen[0].path_params), {})
+
+    async def test_static_dispatch_clears_spoofed_route_context(self) -> None:
+        app = SmallServer()
+        seen = []
+
+        @app.get("/health")
+        async def health(request):
+            seen.append(request)
+            return Response()
+
+        dirty = Request(
+            "GET",
+            "/health",
+            Headers(),
+            path_params={"spoofed": "value"},
+            route_pattern="sensitive-spoofed-pattern",
+        )
+        response = await app.dispatch(dirty)
+        self.assertEqual(response.status, 200)
+        self.assertIsNot(seen[0], dirty)
+        self.assertIsNone(seen[0].route_pattern)
+        self.assertEqual(dict(seen[0].path_params), {})
+
     async def test_http_error_becomes_response(self) -> None:
         app = SmallServer()
 
@@ -61,6 +113,8 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
             app.get("/one")(one)
         with self.assertRaisesRegex(ValueError, "supported HTTP methods"):
             app.route("/trace", ("TRACE",))
+        with self.assertRaisesRegex(ValueError, "query string"):
+            app.get("/one?debug=1")
 
     async def test_failed_multi_method_registration_is_atomic(self) -> None:
         app = SmallServer()

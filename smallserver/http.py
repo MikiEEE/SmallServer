@@ -10,7 +10,18 @@ from types import MappingProxyType
 from typing import Any
 
 _TOKEN = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
-_REASONS = {200: "OK", 201: "Created", 204: "No Content", 400: "Bad Request", 404: "Not Found", 405: "Method Not Allowed", 413: "Payload Too Large", 500: "Internal Server Error", 503: "Service Unavailable"}
+_REASONS = {
+    200: "OK",
+    201: "Created",
+    204: "No Content",
+    400: "Bad Request",
+    404: "Not Found",
+    405: "Method Not Allowed",
+    413: "Payload Too Large",
+    414: "URI Too Long",
+    500: "Internal Server Error",
+    503: "Service Unavailable",
+}
 
 
 class Headers(Mapping[str, str]):
@@ -60,16 +71,45 @@ class Request:
     headers: Headers
     body: bytes = b""
     version: str = "HTTP/1.1"
+    raw_target: str | None = None
+    query_string: str = ""
+    path_params: Mapping[str, str] = field(default_factory=dict)
+    route_pattern: str | None = None
 
     def __post_init__(self) -> None:
         if not _TOKEN.fullmatch(self.method):
             raise ValueError("invalid HTTP method")
+        if not isinstance(self.query_string, str):
+            raise TypeError("query_string must be a string")
+        if self.raw_target is None and "?" not in self.path and self.query_string:
+            raw_target = self.path + "?" + self.query_string
+        else:
+            raw_target = self.path if self.raw_target is None else self.raw_target
+        if not isinstance(raw_target, str) or not raw_target.startswith("/"):
+            raise ValueError("request path/target must start with '/'")
+        target_path, separator, target_query = raw_target.partition("?")
+        if self.raw_target is None:
+            if self.query_string and self.query_string != (target_query if separator else ""):
+                raise ValueError("request target fields are inconsistent")
+            object.__setattr__(self, "path", target_path)
+            object.__setattr__(self, "query_string", target_query if separator else "")
+            object.__setattr__(self, "raw_target", raw_target)
+        elif self.path != target_path or self.query_string != (target_query if separator else ""):
+            raise ValueError("request target fields are inconsistent")
         if not self.path.startswith("/"):
             raise ValueError("request path must start with '/'")
         if not isinstance(self.headers, Headers):
             object.__setattr__(self, "headers", Headers(self.headers))
         if not isinstance(self.body, bytes):
             raise TypeError("request body must be bytes")
+        if not isinstance(self.path_params, Mapping):
+            raise TypeError("path_params must be a mapping")
+        params = dict(self.path_params)
+        if any(not isinstance(name, str) or not isinstance(value, str) for name, value in params.items()):
+            raise TypeError("path_params must map strings to strings")
+        object.__setattr__(self, "path_params", MappingProxyType(params))
+        if self.route_pattern is not None and not isinstance(self.route_pattern, str):
+            raise TypeError("route_pattern must be a string or None")
 
 
 @dataclass(frozen=True)

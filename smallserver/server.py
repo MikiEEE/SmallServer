@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable
 
 from ._transport import KernelTransport, TransportHandle, WakeupChannel
 from .http import Headers, Request, Response
+from .routing import RouteErrorEvent
 from .runtime import ManagedRuntimeConfig
+
+_ROUTE_OBSERVER_SIGNAL = 31
 
 
 class HTTPParseError(Exception):
@@ -22,10 +26,17 @@ class HTTPParseError(Exception):
 class HTTPRequestParser:
     """Incrementally parse one bounded HTTP/1.1 request with Content-Length."""
 
-    def __init__(self, max_header_bytes: int, max_header_count: int, max_body_bytes: int) -> None:
+    def __init__(
+        self,
+        max_header_bytes: int,
+        max_header_count: int,
+        max_body_bytes: int,
+        max_request_target_bytes: int = 8 * 1024,
+    ) -> None:
         self._max_header_bytes = max_header_bytes
         self._max_header_count = max_header_count
         self._max_body_bytes = max_body_bytes
+        self._max_request_target_bytes = max_request_target_bytes
         self._buffer = bytearray()
         self._request_head: tuple[str, str, Headers, int] | None = None
 
@@ -43,13 +54,22 @@ class HTTPRequestParser:
             self._request_head = self._parse_head(bytes(self._buffer[:marker]))
             del self._buffer[:header_length]
 
-        method, path, headers, content_length = self._request_head
+        method, raw_target, headers, content_length = self._request_head
         if len(self._buffer) > content_length:
             raise HTTPParseError(400, "pipelined requests are not supported")
         if len(self._buffer) < content_length:
             return None
         try:
-            return Request(method, path, headers, bytes(self._buffer), "HTTP/1.1")
+            path, separator, query_string = raw_target.partition("?")
+            return Request(
+                method,
+                path,
+                headers,
+                bytes(self._buffer),
+                "HTTP/1.1",
+                raw_target=raw_target,
+                query_string=query_string if separator else "",
+            )
         except ValueError as exc:
             raise HTTPParseError(400, str(exc)) from exc
 
@@ -60,10 +80,12 @@ class HTTPRequestParser:
             raise HTTPParseError(400, "request headers are not valid bytes") from exc
         if not lines or len(lines[0].split(" ")) != 3:
             raise HTTPParseError(400, "malformed request line")
-        method, path, version = lines[0].split(" ")
-        if version != "HTTP/1.1" or not path.startswith("/"):
+        method, raw_target, version = lines[0].split(" ")
+        if version != "HTTP/1.1" or not raw_target.startswith("/"):
             raise HTTPParseError(400, "only origin-form HTTP/1.1 requests are supported")
-        if "#" in path or any(not 0x21 <= ord(character) <= 0x7E for character in path):
+        if len(raw_target.encode("iso-8859-1")) > self._max_request_target_bytes:
+            raise HTTPParseError(414, "request target is too large")
+        if "#" in raw_target or any(not 0x21 <= ord(character) <= 0x7E for character in raw_target):
             raise HTTPParseError(400, "request target is not valid origin-form")
         if len(lines) - 1 > self._max_header_count:
             raise HTTPParseError(413, "too many request headers")
@@ -95,7 +117,7 @@ class HTTPRequestParser:
                 raise HTTPParseError(413, "request body is too large")
         if not headers.get("host"):
             raise HTTPParseError(400, "HTTP/1.1 requests require a Host header")
-        return method, path, headers, length
+        return method, raw_target, headers, length
 
 
 @dataclass(frozen=True)
@@ -110,6 +132,8 @@ class ServerConfig:
     listener_priority: int = 1
     connection_priority: int = 2
     accept_batch_size: int = 16
+    max_request_target_bytes: int = 8 * 1024
+    max_route_error_events: int = 16
     managed_runtime: ManagedRuntimeConfig | None = None
 
     def __post_init__(self) -> None:
@@ -122,6 +146,8 @@ class ServerConfig:
             "listener_priority",
             "connection_priority",
             "accept_batch_size",
+            "max_request_target_bytes",
+            "max_route_error_events",
         ):
             value = getattr(self, name)
             if type(value) is not int or value <= 0:
@@ -130,6 +156,67 @@ class ServerConfig:
             self.managed_runtime, ManagedRuntimeConfig
         ):
             raise TypeError("managed_runtime must be a ManagedRuntimeConfig or None")
+
+
+class RouteObserverChannel:
+    """Bounded scheduler-local delivery state for one server invocation."""
+
+    def __init__(self, observer: Any, max_events: int) -> None:
+        self.observer = observer
+        self.max_events = max_events
+        self.events: deque[RouteErrorEvent] = deque()
+        self.task: Any = None
+        self.accepting = True
+        self.dropped = 0
+        self.failures = 0
+
+    def bind(self, task: Any) -> None:
+        self.task = task
+
+    def enqueue(self, event: RouteErrorEvent, source_task: Any) -> bool:
+        if not self.accepting or len(self.events) >= self.max_events:
+            self.dropped += 1
+            return False
+        self.events.append(event)
+        try:
+            signalled = (
+                self.task is not None
+                and source_task.sendSignal(self.task.getID(), _ROUTE_OBSERVER_SIGNAL) == 0
+            )
+        except BaseException:
+            signalled = False
+        if not signalled:
+            self.events.pop()
+            self.dropped += 1
+            return False
+        return True
+
+    def stop(self) -> None:
+        self.accepting = False
+        self.dropped += len(self.events)
+        self.events.clear()
+        task = self.task
+        if task is not None and not getattr(task, "done", False):
+            try:
+                task.acceptSignal(_ROUTE_OBSERVER_SIGNAL)
+            except BaseException:
+                pass
+
+
+async def run_route_observer(task: Any, channel: RouteObserverChannel) -> None:
+    """Drain sanitized events on a dedicated SmallOS task."""
+    try:
+        while channel.accepting:
+            while channel.events:
+                event = channel.events.popleft()
+                try:
+                    channel.observer(event)
+                except BaseException:
+                    channel.failures += 1
+            if channel.accepting:
+                await task.wait_signal(_ROUTE_OBSERVER_SIGNAL)
+    finally:
+        channel.task = None
 
 
 class ServerHandle:
@@ -145,12 +232,14 @@ class ServerHandle:
         wakeup: WakeupChannel | None,
         config: ServerConfig,
         on_finalized: Callable[[ServerHandle], None] | None = None,
+        route_observer_channel: RouteObserverChannel | None = None,
     ) -> None:
         self._runtime = runtime
         self._transport = transport
         self._listener = listener
         self._wakeup = wakeup
         self._config = config
+        self._route_observer_channel = route_observer_channel
         self._address = transport.local_address(listener)
         self._on_finalized = on_finalized
         self._close_requested = False
@@ -225,6 +314,16 @@ class ServerHandle:
         except BaseException as error:
             self._listener_failed(error, getattr(self._runtime, "cursor", None))
 
+    @property
+    def dropped_route_error_events(self) -> int:
+        channel = self._route_observer_channel
+        return 0 if channel is None else int(channel.dropped)
+
+    @property
+    def route_observer_failures(self) -> int:
+        channel = self._route_observer_channel
+        return 0 if channel is None else int(channel.failures)
+
     def close(self) -> None:
         """Request external shutdown through a kernel wakeup channel."""
         if self._finished:
@@ -297,6 +396,9 @@ class ServerHandle:
             return
         self._close_requested = True
         self._finalization_attempted = True
+        channel = self._route_observer_channel
+        if channel is not None:
+            channel.stop()
         if self._wakeup is not None and not self._wakeup.closed:
             try:
                 self._wakeup.close()

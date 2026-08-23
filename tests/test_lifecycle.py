@@ -130,6 +130,17 @@ class ServerLifecycleTests(unittest.TestCase):
                 SmallServer().listen(config=config, port=0)
         factory.assert_not_called()
 
+        observed = ServerConfig(
+            max_connections=32,
+            managed_runtime=ManagedRuntimeConfig(task_capacity=34),
+        )
+        with patch("smallserver.app._default_runtime_factory") as factory:
+            with self.assertRaisesRegex(ValueError, r"max_connections \+ 3"):
+                SmallServer(route_error_observer=lambda event: None).listen(
+                    config=observed, port=0
+                )
+        factory.assert_not_called()
+
         insufficient = ServerConfig(
             max_connections=32,
             managed_runtime=ManagedRuntimeConfig(task_capacity=33),
