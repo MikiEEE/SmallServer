@@ -18,6 +18,7 @@ from .routing import (
     RouteMatchTimeout,
     RoutePathTooLarge,
 )
+from .runtime import ManagedRuntimeConfig
 from .server import ServerConfig, ServerHandle
 
 if TYPE_CHECKING:
@@ -42,6 +43,7 @@ __all__ = [
     "HTTP2Config",
     "RegexRouteConfig",
     "RegexRoutesUnavailable",
+    "ManagedRuntimeConfig",
     "Request",
     "Response",
     "RouteErrorEvent",

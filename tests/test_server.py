@@ -4,7 +4,12 @@ import unittest
 import warnings
 from unittest.mock import patch
 
-from smallserver import RouteErrorEvent, ServerStartupError, SmallServer
+from smallserver import (
+    ManagedRuntimeConfig,
+    RouteErrorEvent,
+    ServerStartupError,
+    SmallServer,
+)
 from smallserver.errors import _CleanupTransaction
 from smallserver.server import (
     HTTPParseError,
@@ -51,6 +56,98 @@ class HTTPRequestParserTests(unittest.TestCase):
             ServerConfig(max_connections=0)
         with self.assertRaisesRegex(ValueError, "max_connections"):
             ServerConfig(max_connections=True)
+        with self.assertRaisesRegex(ValueError, "max_request_target_bytes"):
+            ServerConfig(max_request_target_bytes=0)
+        with self.assertRaisesRegex(ValueError, "max_route_error_events"):
+            ServerConfig(max_route_error_events=0)
+
+    def test_config_preserves_legacy_positional_field_mapping(self) -> None:
+        config = ServerConfig(1, 2, 3, 4, 5, 6, 7)
+        self.assertEqual(config.max_connections, 1)
+        self.assertEqual(config.max_header_bytes, 2)
+        self.assertEqual(config.max_header_count, 3)
+        self.assertEqual(config.max_body_bytes, 4)
+        self.assertEqual(config.receive_chunk_bytes, 5)
+        self.assertEqual(config.listener_priority, 6)
+        self.assertEqual(config.connection_priority, 7)
+        self.assertEqual(config.max_request_target_bytes, 8 * 1024)
+        self.assertEqual(config.max_route_error_events, 16)
+
+    def test_route_observer_channel_has_deterministic_capacity_and_stop(self) -> None:
+        class ObserverTask:
+            @staticmethod
+            def getID() -> int:
+                return 9
+
+        class SourceTask:
+            signals = []
+
+            def sendSignal(self, pid, signal) -> int:
+                self.signals.append((pid, signal))
+                return 0
+
+        channel = RouteObserverChannel(lambda event: None, max_events=1)
+        channel.bind(ObserverTask())
+        source = SourceTask()
+        first = RouteErrorEvent("regex-route-1", "route_match_timeout")
+        second = RouteErrorEvent("regex-route-2", "route_match_timeout")
+        self.assertTrue(channel.enqueue(first, source))
+        self.assertFalse(channel.enqueue(second, source))
+        self.assertEqual(list(channel.events), [first])
+        self.assertEqual(channel.dropped, 1)
+        self.assertEqual(source.signals, [(9, 31)])
+        channel.stop()
+        self.assertFalse(channel.accepting)
+        self.assertEqual(list(channel.events), [])
+        self.assertEqual(channel.dropped, 2)
+
+        failing_channel = RouteObserverChannel(lambda event: None, max_events=1)
+        failing_channel.bind(ObserverTask())
+
+        class FailingSourceTask:
+            def sendSignal(self, pid, signal) -> int:
+                raise RuntimeError("signal failed")
+
+        self.assertFalse(failing_channel.enqueue(first, FailingSourceTask()))
+        self.assertEqual(list(failing_channel.events), [])
+        self.assertEqual(failing_channel.dropped, 1)
+        with self.assertRaisesRegex(TypeError, "managed_runtime"):
+            ServerConfig(managed_runtime={})  # type: ignore[arg-type]
+
+    def test_managed_runtime_config_is_validated_and_defensively_copied(self) -> None:
+        source = {"http": {"max_response_size": 4096}}
+        config = ManagedRuntimeConfig(
+            task_capacity=128,
+            priority_levels=4,
+            io_buffer_length=0,
+            eternal_watchers=True,
+            client_defaults=source,
+        )
+        source["http"]["max_response_size"] = 1
+
+        self.assertEqual(
+            config.to_smallos_config(),
+            {
+                "task_capacity": 128,
+                "priority_levels": 4,
+                "io_buffer_length": 0,
+                "eternal_watchers": True,
+                "client_defaults": {"http": {"max_response_size": 4096}},
+            },
+        )
+        with self.assertRaises(TypeError):
+            config.client_defaults["http"]["max_response_size"] = 1  # type: ignore[index]
+
+        invalid_values = (
+            {"task_capacity": True},
+            {"priority_levels": 1},
+            {"io_buffer_length": -1},
+            {"eternal_watchers": 1},
+            {"client_defaults": {"http": {"max_response_size": -1}}},
+        )
+        for values in invalid_values:
+            with self.subTest(values=values), self.assertRaises((TypeError, ValueError)):
+                ManagedRuntimeConfig(**values)  # type: ignore[arg-type]
 
     def test_serve_closes_kernel_resources_when_runtime_fork_fails(self) -> None:
         class Runtime:

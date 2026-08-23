@@ -154,56 +154,6 @@ class SmallOSServerIntegrationTests(unittest.TestCase):
             self.assertIn(b"\r\n\r\nfast done", responses["fast"])
             self.assertIn(b"\r\n\r\nslow done", responses["slow"])
 
-    def test_slow_client_does_not_block_a_complete_request(self) -> None:
-        runtime = SmallOS().setKernel(Unix())
-        app = SmallServer()
-
-        @app.get("/fast")
-        async def fast(request):
-            return Response.text("fast")
-
-        try:
-            server = app.serve(runtime, host="127.0.0.1", port=0)
-        except PermissionError:
-            self.skipTest("the current sandbox does not permit loopback TCP binds")
-
-        received: list[bytes] = []
-        errors: list[BaseException] = []
-
-        def clients() -> None:
-            slow = None
-            try:
-                slow = socket.create_connection(("127.0.0.1", server.port), timeout=2)
-                slow.sendall(b"GET /slow HTTP/1.1\r\nHost: local")
-                with socket.create_connection(("127.0.0.1", server.port), timeout=2) as fast_client:
-                    fast_client.sendall(b"GET /fast HTTP/1.1\r\nHost: localhost\r\n\r\n")
-                    while True:
-                        chunk = fast_client.recv(4096)
-                        if not chunk:
-                            break
-                        received.append(chunk)
-            except BaseException as exc:
-                errors.append(exc)
-            finally:
-                if slow is not None:
-                    slow.close()
-                server.close()
-
-        worker = threading.Thread(target=clients, daemon=True)
-        worker.start()
-        runtime.start()
-        worker.join(timeout=2)
-
-        self.assertFalse(worker.is_alive())
-        self.assertEqual(errors, [])
-        self.assertEqual(
-            b"".join(received),
-            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nContent-Type: text/plain; charset=utf-8\r\n"
-            b"Connection: close\r\n\r\nfast",
-        )
-        self.assertEqual(runtime.ioReadWaiters, {})
-        self.assertEqual(runtime.ioWriteWaiters, {})
-
     @unittest.skipUnless(HAS_REGEX, "regex-routes extra is not installed")
     def test_loopback_regex_route_uses_path_without_query(self) -> None:
         runtime = SmallOS().setKernel(Unix())
@@ -317,30 +267,22 @@ class SmallOSServerIntegrationTests(unittest.TestCase):
             {"route_id", "category", "regex-route-1", "route_match_timeout"},
         )
         self.assertFalse(any(isinstance(value, Request) for value in reachable))
-        for secret in (
-            hostile_path,
-            authorization_secret,
-            body_secret.decode("ascii"),
-            pattern_secret,
-        ):
+        for secret in (hostile_path, authorization_secret, body_secret.decode("ascii"), pattern_secret):
             self.assertNotIn(secret, reachable_strings)
 
         caller_strings = {value for value in observer_graph if isinstance(value, str)}
         self.assertFalse(any(isinstance(value, Request) for value in observer_graph))
-        self.assertFalse(
-            any(isinstance(value, RouteMatchTimeout) for value in observer_graph)
-        )
-        for secret in (
-            hostile_path,
-            authorization_secret,
-            body_secret.decode("ascii"),
-            pattern_secret,
-        ):
+        self.assertFalse(any(isinstance(value, RouteMatchTimeout) for value in observer_graph))
+        for secret in (hostile_path, authorization_secret, body_secret.decode("ascii"), pattern_secret):
             self.assertNotIn(secret, caller_strings)
         self.assertNotIn(body_secret, observer_graph)
         self.assertEqual(server.route_observer_failures, 1)
         self.assertEqual(server.dropped_route_error_events, 0)
         self.assertEqual(observer_threads, [runtime_thread])
+        self.assertNotIn(
+            "smallserver-route-observer",
+            {thread.name for thread in threading.enumerate()},
+        )
         channel = server._route_observer_channel
         self.assertIsNotNone(channel)
         assert channel is not None
@@ -385,6 +327,60 @@ class SmallOSServerIntegrationTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertTrue(received[0].startswith(b"HTTP/1.1 414 URI Too Long\r\n"))
         self.assertNotIn(b"must not run", received[0])
+
+    def test_slow_client_does_not_block_a_complete_request(self) -> None:
+        runtime = SmallOS().setKernel(Unix())
+        app = SmallServer()
+
+        @app.get("/fast")
+        async def fast(request):
+            return Response.text("fast")
+
+        try:
+            server = app.serve(runtime, host="127.0.0.1", port=0)
+        except PermissionError:
+            self.skipTest("the current sandbox does not permit loopback TCP binds")
+
+        received: list[bytes] = []
+        errors: list[BaseException] = []
+
+        def clients() -> None:
+            slow = None
+            try:
+                slow = socket.create_connection(("127.0.0.1", server.port), timeout=2)
+                slow.sendall(b"GET /slow HTTP/1.1\r\nHost: local")
+                with socket.create_connection(
+                    ("127.0.0.1", server.port), timeout=2
+                ) as fast_client:
+                    fast_client.sendall(
+                        b"GET /fast HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                    )
+                    while True:
+                        chunk = fast_client.recv(4096)
+                        if not chunk:
+                            break
+                        received.append(chunk)
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                if slow is not None:
+                    slow.close()
+                server.close()
+
+        worker = threading.Thread(target=clients, daemon=True)
+        worker.start()
+        runtime.start()
+        worker.join(timeout=2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            b"".join(received),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nContent-Type: text/plain; charset=utf-8\r\n"
+            b"Connection: close\r\n\r\nfast",
+        )
+        self.assertEqual(runtime.ioReadWaiters, {})
+        self.assertEqual(runtime.ioWriteWaiters, {})
 
     def test_managed_listen_serves_loopback_and_returns_closed_handle(self) -> None:
         app = SmallServer()
