@@ -9,10 +9,10 @@ import unittest
 from unittest.mock import patch
 
 from SmallPackage import SmallOS, SmallTask, SmallWebSocketClient, Unix
-from SmallPackage.adapters.threads import ThreadAdapter
 
 from smallserver import (
     AdapterRegistry,
+    ThreadAdapter,
     Headers,
     Request,
     Response,
