@@ -45,11 +45,13 @@ python3 -m twine check dist/*
 ## Publishing boundary
 
 The automated process creates a GitHub release; it does not publish to PyPI.
-SmallServer currently installs SmallOS from its canonical Git `master` branch
+SmallServer currently installs the canonical SmallOS `v1.2.0` GitHub release
 through `requirements.txt`, while `pyproject.toml` intentionally has no runtime
 dependency declaration. Publishing the wheel to PyPI before SmallOS has an
-installable release dependency would give users an incomplete installation.
+installable package-index dependency would give users an incomplete
+installation.
 
-Add PyPI trusted publishing only after SmallOS has a stable package release,
-SmallServer declares that dependency in `pyproject.toml`, and an installed-wheel
-test proves a clean environment receives every runtime dependency.
+Add PyPI trusted publishing only after SmallOS has a stable package-index
+release, SmallServer declares that dependency in `pyproject.toml`, and an
+installed-wheel test proves a clean environment receives every runtime
+dependency.

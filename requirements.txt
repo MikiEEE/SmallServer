@@ -1,3 +1,3 @@
-# Install SmallOS directly from its canonical master branch. The PyPI package
-# name is not yet available to this project.
--e git+https://github.com/MikiEEE/SmallOS.git@master#egg=SmallPackage
+# Install the canonical SmallOS v1.2.0 GitHub release. The distribution is not
+# yet consumed from a package index by this project.
+SmallPackage @ git+https://github.com/MikiEEE/SmallOS.git@v1.2.0
