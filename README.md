@@ -2,8 +2,8 @@
 
 SmallServer is a small, SmallOS-native HTTP framework for Python 3.10+. It
 serves bounded HTTP/1.1 requests and optional cleartext prior-knowledge HTTP/2,
-supports exact and timeout-bounded regex routes, and provides explicit
-lifecycle and third-party execution controls.
+supports exact and timeout-bounded regex routes, optional RFC 6455 WebSockets,
+and provides explicit lifecycle and third-party execution controls.
 
 ```python
 from smallserver import Response, SmallServer
@@ -69,6 +69,29 @@ optional network-listener `route_error_observer` receives only an immutable `Rou
 with an opaque route ID and category; it never receives the request target,
 headers, body, traceback, or exception graph.
 
+WebSockets use the optional wsproto integration:
+
+```console
+python3 -m pip install -e '.[websocket]'
+```
+
+WebSocket Upgrade routes use a separate static route table, so an ordinary
+`GET` and a WebSocket route can coexist at one path:
+
+```python
+from smallserver import WebSocket
+
+
+@app.websocket("/echo", origins={"https://app.example.com"})
+async def echo(websocket: WebSocket) -> None:
+    await websocket.accept()
+    async for message in websocket:
+        if message.is_text:
+            await websocket.send_text(message.text)
+        else:
+            await websocket.send_bytes(message.bytes)
+```
+
 ### Configure the managed SmallOS runtime
 
 When `listen()` creates the runtime, `ServerConfig.managed_runtime` passes the
@@ -106,15 +129,17 @@ connection-control and stream-handler tasks.
 ## Current boundaries
 
 HTTP/1.1 serves one request per connection. Keep-alive, pipelining, TLS,
-automatic path templates, WebSockets, HTTP/1.1 h2c upgrade, and automatic
-protocol detection are not implemented. Regex routes are an explicit optional
-route form, not automatic path templates.
+automatic path templates, WebSocket compression, RFC 8441 WebSockets over
+HTTP/2, HTTP/1.1 h2c upgrade, and automatic protocol detection are not
+implemented. Regex routes are an explicit optional route form, not automatic
+path templates.
 
 ## Documentation
 
 - [Guide index](guide/index.md)
 - [Getting started](guide/getting-started.md)
 - [Routing](guide/routing.md)
+- [WebSockets](guide/websockets.md)
 - [Requests and responses](guide/requests-and-responses.md)
 - [Runtime and lifecycle](guide/runtime-lifecycle.md)
 - [Configuration](guide/configuration.md)
@@ -126,10 +151,12 @@ route form, not automatic path templates.
 - [Protocol roadmap](guide/protocol-roadmap.md)
 - [Development](guide/development.md)
 
-See [`demo.py`](demo.py) for all five supported HTTP methods,
+See [`demo.py`](demo.py) for all five supported HTTP methods and a WebSocket route,
 [`examples/http2_prior_knowledge.py`](examples/http2_prior_knowledge.py) for
 HTTP/2, [`examples/manual_runtime.py`](examples/manual_runtime.py) for
-caller-owned SmallOS startup, and
+caller-owned SmallOS startup,
+[`examples/websocket_echo.py`](examples/websocket_echo.py) for bounded WebSocket
+echo handling, and
 [`examples/adapters_demo.py`](examples/adapters_demo.py) for blocking and
 asyncio escape hatches.
 

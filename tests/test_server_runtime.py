@@ -447,7 +447,6 @@ def _reachable_objects(root):
             pending.append(vars(value))
     return result
 
-
 def _reachable_container_values(root):
     """Walk frame-local containers without traversing scheduler object graphs."""
     pending = [root]

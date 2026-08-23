@@ -35,11 +35,12 @@ python3 -m pip install -r requirements.txt
 python3 -m pip install -e .
 python3 -m unittest tests.test_http2 -v
 python3 -m unittest tests.test_regex_routing -v
+python3 -m unittest tests.test_websocket -v
 ```
 
-The dependency-contract tests run and HTTP/2 interoperability and regex-engine
-cases skip cleanly; importing and testing HTTP/1.1 must require neither
-hyper-h2 nor regex.
+The dependency-contract tests run and optional interoperability cases skip
+cleanly; importing and testing ordinary HTTP/1.1 must require neither
+hyper-h2, regex, nor wsproto.
 
 Run the examples when their platform requirements are available:
 
@@ -47,6 +48,7 @@ Run the examples when their platform requirements are available:
 python3 demo.py
 python3 examples/adapters_demo.py
 python3 examples/manual_runtime.py
+python3 examples/websocket_echo.py
 ```
 
 The two network examples block until shutdown. `adapters_demo.py` completes on

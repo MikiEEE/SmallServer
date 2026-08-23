@@ -65,6 +65,13 @@ one dedicated task, raising that floor to `max_connections + 3`. HTTP/2 also
 creates bounded connection-control and stream-handler tasks, so configure
 additional capacity from the selected `HTTP2Config` concurrency limits.
 
+## WebSocket configuration
+
+Pass `websocket_config=WebSocketConfig(...)` to `SmallServer`. Its finite
+limits cover accepted WebSocket connections, frames, messages, inbound and
+outbound queues, write chunks, handshake/write/close/idle deadlines, and
+ping/pong liveness. See [WebSockets](websockets.md) for the full boundary.
+
 ## HTTP/2 configuration
 
 Pass `protocol="http2"` and an optional `HTTP2Config` for cleartext

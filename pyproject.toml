@@ -16,6 +16,7 @@ dependencies = []
 dev = ["build>=1.2"]
 http2 = ["h2>=4,<5"]
 regex-routes = ["regex>=2023.10.3,<2027"]
+websocket = ["wsproto>=1.2,<2"]
 test = [
     "build>=1.2",
     "h2>=4,<5",

@@ -21,6 +21,11 @@ route ID and category. Delivery is bounded and scheduler-local, so saturation,
 signal failure, or shutdown may drop the event. Dropped events and observer
 callback failures are reported by the corresponding `ServerHandle` counters.
 
+Ordinary WebSocket handler failures are converted to a sanitized 1011 Close
+frame after an accepted handshake. `KeyboardInterrupt` and `SystemExit`
+preserve their identity. Protocol, capacity, deadline, and disconnect outcomes
+use the typed WebSocket exceptions documented in [WebSockets](websockets.md).
+
 ## Configuration errors
 
 `ServerConfigurationError` reports a runtime or kernel capability that cannot

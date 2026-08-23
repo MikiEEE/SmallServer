@@ -42,8 +42,20 @@ from .server import (
     ServerHandle,
     run_route_observer,
 )
+from .websocket import (
+    WebSocket,
+    WebSocketConfig,
+    WebSocketUnavailable,
+    _WebSocketRoute,
+    _WebSocketState,
+    _is_http_token,
+    _is_upgrade_attempt,
+    _validate_upgrade,
+    run_websocket_connection,
+)
 
 Handler = Callable[[Request], Awaitable[Response]]
+WebSocketHandler = Callable[[WebSocket], Awaitable[None]]
 RouteErrorObserver = Callable[[RouteErrorEvent], None]
 _METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE"})
 _HTTP2_WRITER_SIGNAL = 30
@@ -178,6 +190,7 @@ class SmallServer:
         regex_config: RegexRouteConfig | None = None,
         *,
         route_error_observer: RouteErrorObserver | None = None,
+        websocket_config: WebSocketConfig | None = None,
     ) -> None:
         if route_error_observer is not None and not callable(route_error_observer):
             raise TypeError("route_error_observer must be callable or None")
@@ -186,6 +199,12 @@ class SmallServer:
         # while the Router owns all registration and lookup behavior.
         self._routes = self._router._static
         self._route_error_observer = route_error_observer
+        if websocket_config is not None and not isinstance(
+            websocket_config, WebSocketConfig
+        ):
+            raise TypeError("websocket_config must be a WebSocketConfig or None")
+        self._websocket_config = websocket_config or WebSocketConfig()
+        self._websocket_routes: dict[str, _WebSocketRoute] = {}
         self._active_invocation: object | ServerHandle | None = None
         self._invocation_lock: Any = (
             allocate_lock() if allocate_lock is not None else _NoThreadLock()
@@ -241,6 +260,48 @@ class SmallServer:
 
     def delete(self, path: str) -> Callable[[Handler], Handler]:
         return self.route(path, ("DELETE",))
+
+    def websocket(
+        self,
+        path: str,
+        *,
+        origins: Iterable[str] | None = None,
+        subprotocols: Iterable[str] = (),
+    ) -> Callable[[WebSocketHandler], WebSocketHandler]:
+        """Register a static HTTP/1.1 WebSocket Upgrade route."""
+        if not isinstance(path, str) or not path.startswith("/"):
+            raise ValueError("WebSocket route path must start with '/'")
+        if "?" in path or "#" in path:
+            raise ValueError("WebSocket route path must not contain query or fragment")
+        if path in self._websocket_routes:
+            raise ValueError("WebSocket route already registered: {}".format(path))
+        origin_set: frozenset[str] | None = None
+        if origins is not None:
+            if isinstance(origins, str):
+                raise TypeError("WebSocket origins must be an iterable of strings")
+            origin_set = frozenset(origins)
+            if any(not isinstance(origin, str) or not origin for origin in origin_set):
+                raise ValueError("WebSocket origins must be non-empty strings")
+        if isinstance(subprotocols, str):
+            raise TypeError("WebSocket subprotocols must be an iterable of tokens")
+        protocols = tuple(dict.fromkeys(subprotocols))
+        if any(
+            not isinstance(protocol, str) or not _is_http_token(protocol)
+            for protocol in protocols
+        ):
+            raise ValueError("WebSocket subprotocols must be valid HTTP tokens")
+
+        def register(handler: WebSocketHandler) -> WebSocketHandler:
+            if not callable(handler):
+                raise TypeError("WebSocket handler must be callable")
+            if path in self._websocket_routes:
+                raise ValueError("WebSocket route already registered: {}".format(path))
+            self._websocket_routes[path] = _WebSocketRoute(
+                handler, origin_set, protocols
+            )
+            return handler
+
+        return register
 
     def route_regex(self, pattern: str, methods: Iterable[str]) -> Callable[[Handler], Handler]:
         """Register a timeout-bounded full-path regular-expression route."""
@@ -693,6 +754,7 @@ class SmallServer:
             handle._config.max_header_count,
             handle._config.max_body_bytes,
             handle._config.max_request_target_bytes,
+            preserve_trailing_data=True,
         )
         primary_error: BaseException | None = None
         route_error_event: RouteErrorEvent | None = None
@@ -715,6 +777,25 @@ class SmallServer:
                     return
                 if request is None:
                     continue
+                if _is_upgrade_attempt(request):
+                    response = await self._dispatch_websocket(
+                        task,
+                        handle,
+                        client,
+                        request,
+                        parser.trailing_data,
+                    )
+                    if response is not None:
+                        await self._send_response(task, handle, client, response)
+                    return
+                if parser.trailing_data:
+                    await self._send_response(
+                        task,
+                        handle,
+                        client,
+                        Response.text("pipelined requests are not supported", status=400),
+                    )
+                    return
                 try:
                     response = await self.dispatch(request)
                 except RouteMatchTimeout as exc:
@@ -742,6 +823,40 @@ class SmallServer:
         observer_channel = handle._route_observer_channel
         if observer_channel is not None:
             observer_channel.enqueue(event, task)
+
+    async def _dispatch_websocket(
+        self,
+        task: Any,
+        handle: ServerHandle,
+        client: TransportHandle,
+        request: Request,
+        trailing_data: bytes,
+    ) -> Response | None:
+        route = self._websocket_routes.get(request.path)
+        if route is None:
+            return Response.text("not found", status=404)
+        invalid = _validate_upgrade(request, route)
+        if invalid is not None:
+            return invalid
+        if len(handle._websocket_states) >= min(
+            self._websocket_config.max_connections,
+            handle._config.max_connections,
+        ):
+            return Response.text("WebSocket capacity reached", status=503)
+        try:
+            state = _WebSocketState(
+                handle._runtime,
+                handle._transport,
+                client,
+                request,
+                route,
+                self._websocket_config,
+                trailing_data,
+            )
+        except WebSocketUnavailable as exc:
+            return Response.text(str(exc), status=503)
+        await run_websocket_connection(task, state, handle)
+        return None
 
     async def _send_response(
         self,

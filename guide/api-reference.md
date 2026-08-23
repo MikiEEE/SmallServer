@@ -5,13 +5,15 @@ omit overload detail where prose is clearer.
 
 ## Application
 
-### `SmallServer(regex_config=None, *, route_error_observer=None)`
+### `SmallServer(regex_config=None, *, route_error_observer=None, websocket_config=None)`
 
 - `get(path)`, `post(path)`, `put(path)`, `patch(path)`, `delete(path)` — route
   decorators for one supported method.
 - `route(path, methods)` — atomic multi-method route decorator.
 - `get_regex`, `post_regex`, `put_regex`, `patch_regex`, `delete_regex`, and
   `route_regex(pattern, methods)` — optional timeout-bounded regex decorators.
+- `websocket(path, *, origins=None, subprotocols=())` — static HTTP/1.1
+  WebSocket Upgrade decorator.
 - `async dispatch(request)` — dispatch an existing `Request`.
 - `listen(host="127.0.0.1", port=8000, config=None, *, protocol="http1",`
   `http2_config=None, runtime=None, start=None)`
@@ -66,6 +68,19 @@ Operations: `close()`, `async close_from_task(task)`, and `finalize()`.
 Finite optional-regex limits. `RouteErrorEvent`, `RouteMatchTimeout`,
 `RoutePathTooLarge`, and `RegexRoutesUnavailable` describe its bounded error
 surface. Runtime regex matching requires `smallserver[regex-routes]`.
+
+## WebSockets
+
+- `WebSocketConfig` — finite connection, frame, message, mailbox, and deadline
+  limits.
+- `WebSocket` — `accept`, `reject`, receive/send methods, `ping`, `close`,
+  iteration, `request`, and negotiated `subprotocol`.
+- `WebSocketMessage` — complete typed text or binary message.
+- `WebSocketDisconnect`, `WebSocketStateError`, and `WebSocketCapacityError` —
+  application-visible lifecycle and capacity outcomes.
+- `WebSocketUnavailable` — the optional `wsproto` engine is missing.
+
+See [WebSockets](websockets.md) for handshake and completion semantics.
 
 ## Adapters
 
